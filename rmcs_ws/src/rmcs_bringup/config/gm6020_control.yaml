@@ -1,0 +1,98 @@
+rmcs_executor:
+  ros__parameters:
+    # 电机控制环必须跑在高频。注意本文件里的 PID 增益（尤其 ki/kd）都是按 1000Hz 标注的：
+    # PidCalculator 的 ki/kd 不乘 dt，改这个值必须重新整定 PID，
+    # 而且 signal_timeout_ms 也要相应留出余量。
+    update_rate: 1000.0
+
+    # 给 1kHz 控制线程实时调度，避免被 DDS、usbip、桌面等抢占而抖动。
+    # 语法见 rmcs_utility/thread_config.hpp：name/cpus/policy/priority/nice。
+    # 多核机器上再加 cpus=<空闲核> 做绑核可以进一步减少迁移抖动（先看 nproc），例如：
+    #   thread_config: "name=rmcs-update;policy=fifo;priority=50;cpus=3"
+    # 如果容器没有 CAP_SYS_NICE，设置会失败但只打一条警告，不影响运行。
+    thread_config: "name=rmcs-update;policy=fifo;priority=50"
+
+    components:
+      - rmcs_core::hardware::Gm6020ControlBoard -> gm6020_board
+
+      # 把 double 输出转发成同名 std_msgs/Float64 话题，供 Foxglove 观察。
+      # 每个话题都是 1kHz，话题越多主机负载越高；不需要时注释掉。
+      - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
+      # - rmcs_core::debug::ValueCollector -> value_collector
+
+# 板级 IO：CBoard 板卡 + CAN1 上的 GM6020 + DBUS 遥控
+gm6020_board:
+  ros__parameters:
+    board_serial: ""                 # USB 序列号过滤，留空表示不筛选
+    skip_version_check: false        # 板卡固件与 SDK 版本不匹配时置 true
+
+    motor_id: 1                      # GM6020 电调 ID，1~4 用 0x1FE 帧，5~7 用 0x2FE
+    motor_reversed: false
+    encoder_zero_point: 0            # 上电后的零位偏置（原始计数，0~8191）
+
+    signal_timeout_ms: 100.0         # DBUS 与 CAN 反馈的失联判定阈值
+    max_temperature: 70.0            # 超过则无条件失能
+
+    # 反馈滤波：一阶低通，截止频率取速度环带宽的 2~4 倍
+    # update_rate = 1000Hz 时，80Hz -> alpha ≈ 0.334
+    velocity_filter_cutoff_hz: 80.0
+
+# 控制律：摇杆映射 + 单环速度 / 双环角度 PID
+gm6020_board_command:
+  ros__parameters:
+    deadzone: 0.05                   # 摇杆死区，避免零漂导致电机缓慢爬行
+
+    max_velocity: 20.0               # rad/s，单环模式下摇杆满打对应的速度
+    max_angle_rate: 6.0              # rad/s，双环模式下摇杆满打时目标角的变化率
+    angle_min: -3.0                  # 角度给定限幅（多圈角度，单位 rad）
+    angle_max: 3.0
+
+    # 内环：速度环。输出是力矩，量程对齐 GM6020 的 0.741 N*m/A * 3A = 2.223 N*m。
+    # 注意 PidCalculator 的 ki/kd 不乘 dt：ki 是「每 tick 累加」，
+    # 所以在 1000Hz 下 ki=0.02 相当于每秒 20 倍误差的积分增益，改 update_rate 必须重调。
+    velocity_kp: 0.02
+    velocity_ki: 0.05
+    velocity_kd: 0.0
+    velocity_integral_min: -0.5
+    velocity_integral_max: 0.5
+    velocity_integral_split_min: -20.0
+    velocity_integral_split_max: 20.0
+    velocity_output_min: -2.223
+    velocity_output_max: 2.223
+
+    # 外环：角度环。输出是速度给定，限幅与 max_velocity 保持一致。
+    angle_kp: 4.0
+    angle_ki: 0.0
+    angle_kd: 0.0
+    angle_integral_min: -1.0
+    angle_integral_max: 1.0
+    angle_integral_split_min: -0.5
+    angle_integral_split_max: 0.5
+    angle_output_min: -6.283185307179586
+    angle_output_max: 6.283185307179586
+
+# 观察用（配合上面的 ValueBroadcaster）：每个信号发布为同名 std_msgs/Float64 话题。
+# 在 Foxglove 里对话题的 data 字段画曲线。
+value_broadcaster:
+  ros__parameters:
+    forward_list:
+      - /motor/angle                 # 实际角度 rad（多圈）
+      - /motor/velocity              # 实际转速 rad/s（电调上报，未滤波）
+      - /motor/velocity_filtered     # 实际转速 rad/s（低通后，速度环真正使用的反馈）
+      - /motor/velocity_setpoint     # 控制速度 rad/s（速度环给定；角度模式下是外环输出）
+      - /motor/angle_setpoint        # 控制角度 rad（角度环给定；非角度模式为 nan）
+      - /motor/applied_torque        # 实际下发力矩 N*m
+      - /motor/control_mode          # 0=失能 1=单环速度 2=双环角度
+
+# 需要落盘做 PID 整定时，把 components 里的 ValueCollector 取消注释
+value_collector:
+  ros__parameters:
+    csv_path: "/tmp/gm6020_<timestamp>.csv"
+    signals:
+      - /motor/angle
+      - /motor/velocity_filtered
+      - /motor/applied_torque
+      - /motor/angle_setpoint
+      - /motor/velocity_setpoint
+    write_interval: 5
+    flush_interval: 1000
