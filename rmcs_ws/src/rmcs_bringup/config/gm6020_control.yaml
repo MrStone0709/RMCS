@@ -9,7 +9,9 @@ rmcs_executor:
     # 语法见 rmcs_utility/thread_config.hpp：name/cpus/policy/priority/nice。
     # 多核机器上再加 cpus=<空闲核> 做绑核可以进一步减少迁移抖动（先看 nproc），例如：
     #   thread_config: "name=rmcs-update;policy=fifo;priority=50;cpus=3"
-    # 如果容器没有 CAP_SYS_NICE，设置会失败但只打一条警告，不影响运行。
+    # 注意：WSL2 的容器里拿不到 RT 调度权限，启动时会打一条
+    # "Failed to set thread scheduling policy: Operation not permitted" 警告，
+    # 属预期，不影响运行；在原生 Linux（MiniPC）上会正常生效。
     thread_config: "name=rmcs-update;policy=fifo;priority=50"
 
     components:
@@ -44,24 +46,37 @@ gm6020_board_command:
 
     max_velocity: 20.0               # rad/s，单环模式下摇杆满打对应的速度
     max_angle_rate: 6.0              # rad/s，双环模式下摇杆满打时目标角的变化率
-    angle_min: -3.0                  # 角度给定限幅（多圈角度，单位 rad）
+
+    # 角度给定的行程限幅。单位是 rad：3.0 rad = 171.9°，不是 3°。
+    # 角度给定是多圈增量式累加的，必须限幅，否则摇杆一直推着目标角会无限绕下去。
+    # 按机构实际可转范围设置并留 20% 余量（例如 ±30° -> ±0.5236）。
+    angle_min: -3.0
     angle_max: 3.0
 
     # 内环：速度环。输出是力矩，量程对齐 GM6020 的 0.741 N*m/A * 3A = 2.223 N*m。
-    # 注意 PidCalculator 的 ki/kd 不乘 dt：ki 是「每 tick 累加」，
-    # 所以在 1000Hz 下 ki=0.02 相当于每秒 20 倍误差的积分增益，改 update_rate 必须重调。
+    #
+    # PidCalculator 的 ki/kd 不乘 dt：ki 是「每 tick 累加」，
+    # 有效积分增益 = ki * update_rate，所以改 update_rate 必须重调 ki/kd。
+    #
+    # 【关键】积分能贡献的最大力矩 = ki * integral_max，这个量必须大于电机的
+    # 静摩擦 + 齿槽力矩，否则电机顶不开，会留下一个固定的角度死区。稳态（静止）时：
+    #     力矩 e -> = velocity_kp * angle_kp * e + ki * integral_max
+    # 令它等于静摩擦力矩即可解出死区宽度。之前 integral_max=0.5/1.0 时
+    # ki*integral_max 只有 0.005~0.025 N*m，远小于静摩擦，所以才会有 0.2 rad 的死区
+    # 和小幅抖动。现在 0.001 * 300 = 0.3 N*m，已足够。
     velocity_kp: 0.02
-    velocity_ki: 0.05
+    velocity_ki: 0.001
     velocity_kd: 0.0
-    velocity_integral_min: -0.5
-    velocity_integral_max: 0.5
+    velocity_integral_min: -300.0
+    velocity_integral_max: 300.0
     velocity_integral_split_min: -20.0
     velocity_integral_split_max: 20.0
     velocity_output_min: -2.223
     velocity_output_max: 2.223
 
-    # 外环：角度环。输出是速度给定，限幅与 max_velocity 保持一致。
-    angle_kp: 4.0
+    # 外环：角度环。输出是速度给定，angle_output_min/max 就是最大接近速度，
+    # 与上面的 max_velocity 无关（max_velocity 只用于单环模式）。
+    angle_kp: 11.0
     angle_ki: 0.0
     angle_kd: 0.0
     angle_integral_min: -1.0
