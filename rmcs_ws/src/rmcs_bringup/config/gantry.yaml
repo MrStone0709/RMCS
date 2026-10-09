@@ -1,0 +1,249 @@
+# ============================================================================
+# 龙门发射架（方案 III）：三台 M2006+C610 全部挂在 C 板 CAN1 上（ID 1 / 2 / 3）
+#
+# 控制结构：
+#   摇杆映射 + 自动找最高点 + 限位 + 看门狗  ->  hardware::LauncherGantry
+#   三路速度环                              ->  controller::pid::PidController x3
+#   没有角度环：松手 = 速度给 0（靠丝杆自锁保位），所以不需要 /tf、不需要 IMU。
+#
+# 速度给定与速度反馈**都是电机输出轴 rad/s**（M2006 空载约 500 rpm ≈ 52 rad/s），
+# 不做任何几何换算 —— 几何参数只用于角度显示、歪斜量和自动限位。
+# （上一版 yaw 用"机构角 rad/s"再按 yaw_rad_per_motor_turn 换算，默认按直驱算出来只有
+#   0.3 rad/s ≈ 2.9 rpm，速度环力矩不到 0.04 N*m，表现为"摇杆推了偏航电机完全不动"；
+#   同时 +/-0.5 rad 的偏航软限位在电机轴只相当于 0.08 圈，几乎立刻把给定清零。两处都已修掉。）
+#
+# 自动找最高点（上电自检）：
+#   使能后俯仰轴以 homing_rise_velocity 持续上升，两台 pitch 电机收到同一个速度给定
+#   -> 同步上升；当两台电机**同时持续堵转**（推得动但不动）时判定到顶，俯仰停转，
+#   把此时的俯仰角记为**上限软限位**，之后摇杆无法再把俯仰推过该角度。
+#   下限软限位本版取消（下行保护依赖底部限位开关，若已接）。
+#   进度看 /gimbal/homing_state：0=待机 1=上升中 2=回退中 3=已完成 4=超时失败 5=已关闭。
+#
+# 同步前进怎么保证：
+#   1) 两台 pitch 电机的 setpoint 由硬件组件在同一个 tick 用同一个摇杆值算出，正常时数值相同；
+#   2) 两侧速度环 kp/ki/kd 必须逐字相同（下面两段是复制关系，改一边就改另一边）；
+#   3) 唯一会让两路给定不同的是"单侧底部限位触发"，这是故意的：一侧压到底就停，
+#      另一侧继续 -> "两侧一起往下压到底" 就是重新对齐、消除累积歪斜的操作。
+#   注意：本方案没有"两侧高度差反馈"，属于"同给定电子轴"，累积歪斜靠
+#      "压到底对齐 + 相同参数 + 常数前馈 + 低速"来压住；看 /gimbal/pitch/skew_m 验收。
+#
+# 前置条件：rmcs_core/plugins.xml 里已注册
+#   <class type="rmcs_core::hardware::LauncherGantry" base_class_type="rmcs_executor::Component" />
+#
+# 接线：C 板 CAN1 -> 三台 C610（yaw=ID1, pitch_left=ID2, pitch_right=ID3）；C 板 DBUS -> DR16。
+# ============================================================================
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    components:
+      - rmcs_core::hardware::LauncherGantry -> launcher_hardware
+      - rmcs_core::controller::pid::PidController -> yaw_velocity_pid_controller
+      - rmcs_core::controller::pid::PidController -> pitch_left_velocity_pid_controller
+      - rmcs_core::controller::pid::PidController -> pitch_right_velocity_pid_controller
+      - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
+
+# ---------------------------------------------------------------------------
+# 硬件层参数
+# ---------------------------------------------------------------------------
+launcher_hardware:
+  ros__parameters:
+    # 板卡：留空 = 自动选取第一块 C 板
+    board_serial: ""
+    # 固件版本校验（升级/调试期可临时置 true）
+    skip_version_check: false
+
+    # ---- 三台电机。注意 C610 只能用 ID 1~4（0x200 帧只覆盖 1~4）----
+    # reversed 决定"电机正方向"。上电后如果两台 pitch 电机**反向运动**，
+    # 说明其中一台的 reversed 配错（或两根丝杆旋向相反），改这里即可，不用改代码。
+    # 电机朝向已经配置正确，不要乱改。
+    yaw_motor:
+      motor_id: 1
+      reversed: true
+      encoder_zero_point: 0
+    pitch_left_motor:
+      motor_id: 2
+      reversed: true
+      encoder_zero_point: 0
+    pitch_right_motor:
+      motor_id: 3
+      reversed: true
+      encoder_zero_point: 0
+    # encoder_zero_point：把机构停在参考位后调 /gimbal/calibrate（std_msgs/Int32，0=全部），
+    # 把打印出来的值填到这里（RMCS 既有标定流程；上电时机构必须停在该参考位）。
+
+    # ---- 机构几何：只用于角度显示、歪斜量与自动限位（不影响速度给定）----
+    # 丝杆导程（mm/圈），电机与丝杆直连时就是它
+    screw_lead_mm_per_turn: 2.0
+    # 横梁升高 1 m 对应的俯仰角变化 rad（用倾角仪标定）
+    pitch_rad_per_meter: 2.5
+    # yaw 电机输出轴转 1 圈对应的偏航角 rad（只影响 /gimbal/yaw/angle_rad 与偏航软限位）
+    yaw_rad_per_motor_turn: 6.283185307
+    # 上电参考位对应的俯仰角 / 偏航角
+    pitch_zero_rad: 0.0
+    yaw_zero_rad: 0.0
+
+    # ---- 摇杆映射：推进深度 正比于 转速 ----
+    # 单位一律是**电机输出轴 rad/s**（= 输出 rpm / 9.549；M2006 空载约 500 rpm ≈ 52 rad/s）
+    # 摇杆死区（DR16 本身也有 1~2% 抖动）
+    stick_deadzone: 0.02
+    # 左摇杆物理竖直轴（前推 -> 俯仰升高）；若手感相反改成 -1.0
+    pitch_axis_sign: 1.0
+    # 左摇杆物理水平轴（右推 -> 偏航正向）；若手感相反改成 -1.0
+    yaw_axis_sign: 1.0
+    # 满杆俯仰速度（电机轴 rad/s，两台 pitch 共用）
+    # 50 rad/s ≈ 480 rpm 输出 ≈ 2mm 导程下 0.04 rad/s 的俯仰角速度
+    max_pitch_velocity_motor: 50.0
+    # 满杆偏航速度（电机轴 rad/s）
+    max_yaw_velocity_motor: 50.0
+    # 右拨杆 MIDDLE 时的限速比例（精细微调模式）
+    slow_speed_scale: 0.35
+
+    # ---- 自动找最高点（上电自检：持续上升 -> 持续堵转 -> 记为上限）----
+    homing_enabled: true
+    # 上升速度（电机轴 rad/s，40 约等于 380 rpm 输出）
+    homing_rise_velocity: 10.0
+    # 堵转判据：|速度| 低于此值 且 |力矩| 高于下值（两台 pitch 电机都要满足）
+    homing_stall_velocity: 2.0
+    homing_stall_torque: 0.4
+    # 连续满足多少个周期才确认（update_rate=1000 时 100 = 0.1 s；改 update_rate 要同步改这里）
+    homing_stall_confirm_ticks: 100
+    # 超时未找到最高点 -> 停转并把上限退回下面的 pitch_max_rad 兜底值（20000 = 20 s）
+    homing_timeout_ticks: 40000
+    # 是否要求遥控在线且拨杆不在"双 DOWN 失能"位才允许自动上升（台架调试可置 false）
+    homing_require_remote: true
+    # >0 时找到最高点后退若干周期（避免长期顶在机械限位上）
+    homing_backoff_ticks: 0
+    homing_backoff_velocity: 20.0
+    # ---- 下面三条是"长时间待机后机构突然满速上升"事故的防护 ----
+    # 自动上升只允许在进程启动后的这个窗口内开始（60000 = 60 s）；超过窗口必须发
+    # /gimbal/home（std_msgs/Int32 非 0）显式触发。
+    # 不加这条的话：待机时遥控关着（状态一直停在 IDLE），回来一开遥控 -> 机构立刻自己冲上去。
+    homing_start_window_ticks: 60000
+    # 上升过程中被中断（拨杆失能/遥控离线）超过这么多周期（2000 = 2 s）就判失败并停转，
+    # 不再"等条件恢复后接着往上冲"；硬件故障（反馈超时/过温）则立即判失败。
+    homing_interrupt_abort_ticks: 2000
+    # 还没找到最高点（未标定/失败）时，摇杆向上的速度再乘这个比例，避免盲目满速冲顶
+    unhomed_up_speed_scale: 0.25
+
+    # ---- 软限位 ----
+    # 俯仰上限：homing 成功时用**自动测得值**；homing 关闭或超时失败时用下面这个兜底值
+    pitch_max_rad: 0.60
+    # 俯仰下限：本版取消（"最低点软限位暂时取消"）。下行只有底部限位开关保护（若已接），
+    # 所以建议 max_pitch_velocity_motor 不要取得太大，或尽快把底部限位接上。
+    # 偏航软限位：默认关闭（yaw_rad_per_motor_turn 未知时极易误触发，把给定清零）
+    yaw_limit_enabled: false
+    yaw_min_rad: -0.50
+    yaw_max_rad: 0.50
+
+    # ---- 底部限位开关：C 板 GPIO 通道 0..6 = PWM1..PWM7；-1 = 未接/暂不启用 ----
+    # 接线确认后再填。填错（或通道悬空被内部上拉）会导致"一直报触底、无法下降"。
+    pitch_left_limit_gpio: -1
+    pitch_right_limit_gpio: -1
+    # 触发时 GPIO 是高电平还是低电平
+    limit_active_high: true
+    # 开关一端接 GND 时用内部上拉
+    limit_pull_up: true
+    # 周期读取周期
+    limit_read_period_ms: 20
+
+    # ---- 安全 ----
+    # 电机 CAN 反馈超时（任一路超时即失能；遥控失联单独判为 disabled，不算 fault）
+    signal_timeout_ms: 100.0
+    # 任一电机温度超过即失能
+    max_temperature: 70.0
+
+# ---------------------------------------------------------------------------
+# 三路速度环。measurement/setpoint/control 单位都是电机输出轴 rad/s。
+# 调参顺序：先调 yaw，再单独调 pitch_left，最后把 pitch_right 的 kp/ki/kd 抄成完全一样。
+#   kp 从 0.2 起（丝杆静摩擦大，太小会出现"给定非零但电机不动"的死区），ki 0.05 起，kd 建议 0。
+#   integral_split 是积分作用区间：|误差| 小于它才积分（避免起步饱和时积太多）。
+#   output_min/max 就是力矩限幅：M2006 上限 1.8 N*m（10 A），不要超过。
+#   feedforward 是常数力矩前馈；偏航是双向运动，常值前馈会造成静止时的偏向，建议保持 0。
+# 拨杆约定（沿用 RMCS 惯例）：双 DOWN = 失能；右 UP = 满速；右 MIDDLE = 按 slow_speed_scale 限速。
+# 若 /gimbal/{yaw,pitch_*}/control_velocity 有值、电机 torque 却恒为 0，说明下面
+#   control: 的名字与硬件输出名不一致（这类接口是可选输入，配错不报错，只会一直 0 力矩）。
+# ---------------------------------------------------------------------------
+yaw_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/yaw/velocity
+    setpoint: /gimbal/yaw/control_velocity
+    control: /gimbal/yaw/control_torque
+    feedforward: 0.0
+    kp: 0.2
+    ki: 0.05
+    kd: 0.0
+    integral_min: -1.0
+    integral_max: 1.0
+    integral_split_min: -5.0
+    integral_split_max: 5.0
+    output_min: -1.8
+    output_max: 1.8
+
+# 左、右两台 pitch 电机：setpoint 各读自己的名字（硬件正常时两路数值相同）。
+# kp/ki/kd/integral/output 必须完全一致，只有 feedforward 允许按两侧摩擦差异分别标定。
+pitch_left_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/pitch_left/velocity
+    setpoint: /gimbal/pitch_left/control_velocity
+    control: /gimbal/pitch_left/control_torque
+    feedforward: 0.0
+    kp: 0.2
+    ki: 0.05
+    kd: 0.0
+    integral_min: -1.0
+    integral_max: 1.0
+    integral_split_min: -5.0
+    integral_split_max: 5.0
+    output_min: -1.8
+    output_max: 1.8
+
+pitch_right_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/pitch_right/velocity
+    setpoint: /gimbal/pitch_right/control_velocity
+    control: /gimbal/pitch_right/control_torque
+    feedforward: 0.0
+    kp: 0.2
+    ki: 0.05
+    kd: 0.0
+    integral_min: -1.0
+    integral_max: 1.0
+    integral_split_min: -5.0
+    integral_split_max: 5.0
+    output_min: -1.8
+    output_max: 1.8
+
+# ---------------------------------------------------------------------------
+# 观测：把关心的话题转发到 ROS2（Foxglove 里看曲线）。整定/验收时打开。
+# 排查"摇杆推了电机不动"：先看 /gimbal/stick/{pitch_axis,yaw_axis}（摇杆解析结果）
+#   -> 再看 /gimbal/{yaw,pitch_*}/control_velocity（速度给定）
+#   -> 再看 /gimbal/{yaw,pitch_*}/torque（是否有力矩）与 velocity（是否在转）。
+# 验收歪斜：/gimbal/pitch/skew_m、两侧 velocity/torque 的差。
+# 找最高点：/gimbal/homing_state、/gimbal/pitch/upper_limit_rad。
+# ---------------------------------------------------------------------------
+value_broadcaster:
+  ros__parameters:
+    forward_list:
+      - /gimbal/stick/pitch_axis
+      - /gimbal/stick/yaw_axis
+      - /gimbal/yaw/velocity
+      - /gimbal/yaw/control_velocity
+      - /gimbal/yaw/torque
+      - /gimbal/pitch_left/velocity
+      - /gimbal/pitch_right/velocity
+      - /gimbal/pitch_left/control_velocity
+      - /gimbal/pitch_right/control_velocity
+      - /gimbal/pitch_left/torque
+      - /gimbal/pitch_right/torque
+      - /gimbal/pitch_left/limit_switch
+      - /gimbal/pitch_right/limit_switch
+      - /gimbal/pitch/angle_rad
+      - /gimbal/pitch/upper_limit_rad
+      - /gimbal/pitch/skew_m
+      - /gimbal/pitch/skew_rad
+      - /gimbal/yaw/angle_rad
+      - /gimbal/control_mode
+      - /gimbal/homing_state
+      - /gimbal/fault
+      - /gimbal/tx_failures
+      - /gimbal/max_temperature
