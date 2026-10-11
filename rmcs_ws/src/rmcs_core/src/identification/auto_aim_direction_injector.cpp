@@ -258,14 +258,19 @@ private:
         }
         const double measured = *measured_yaw_;
 
-        // 阶段划分：
-        //   [0, settle_s_)                   -> 保持当前方向（等待初始偏转完成）
-        //   [settle_s_, settle_s_+hold_before_) -> 第 0 级基准
-        //   之后每 step_hold_s_ 跳一级
-        const double t_steps = t_ - settle_s_ - hold_before_;
-        int level = 0;
-        if (t_steps >= 0.0) {
-            level = static_cast<int>(t_steps / step_hold_s_);
+        // 阶段划分（时间驱动，各阶段起点/时长明确）：
+        //   [0, settle_s_)                                -> 保持当前方向，等初始偏转完成
+        //   [settle_s_, settle_s_+hold_before_)            -> 第 0 级基准（offset=0）
+        //   之后每 step_hold_s_ 跳一级，共 step_count_ 级
+        //
+        // 注意 level 必须在**第一次建立基准时**就置 1，否则那一级会被漏掉
+        // （旧实现用累计时间算 level，导致第 1 级与实测阶跃时刻错开约 0.5 s）。
+        const double t_level1 = settle_s_ + hold_before_; // 第 1 级起始时刻
+        int level = 1;
+        if (t_ < t_level1) {
+            level = 0;
+        } else {
+            level = 1 + static_cast<int>((t_ - t_level1) / step_hold_s_);
             if (level > step_count_)
                 level = step_count_;
         }

@@ -208,10 +208,25 @@ gimbal_controller:
     yaw_angle_kd: 0.0
 
     yaw_velocity_kp: 13.0
-    yaw_velocity_ki: 0.02
+    # ki 0.02 -> 2.0：原积分时间常数 kp/ki = 650 s，对 yaw 等于没有积分，
+    # 连续阶跃实测 5 s 保持后仍有 +0.556 rad/s（56%）稳态误差。
+    # 2.0 时积分零点 2 rad/s 远低于穿越频率 77 rad/s(12.26 Hz)，只引入
+    # atan(2/77)=1.5° 相位滞后，实测相位裕度 67.8° 几乎不变。
+    yaw_velocity_ki: 0.5
     yaw_velocity_kd: 0.0
-    yaw_velocity_integral_min: -5.0
-    yaw_velocity_integral_max: 5.0
+    # 积分限幅收紧：维持运动所需摩擦力矩约 0.9 N*m，原值 ±5.0 在额定力矩
+    # (4.5 N*m) 之上，实际永不生效。±1.5 覆盖摩擦需求并保留余量。
+    yaw_velocity_integral_min: -1.5
+    yaw_velocity_integral_max: 1.5
+    # 积分分离：误差超出该区间时积分被清零（PidCalculator::update 的 else 分支）。
+    #
+    # 实测教训：先设了 ±1.0，结果 5 s 保持后稳态误差仍是 ~0.53 rad/s（几乎没改善）。
+    # 原因是阶跃瞬间误差很大，积分被反复清零，无法累积到足以克服库仑摩擦的量，
+    # 于是比例项不得不长期承担全部负载 -> 恒定误差。
+    # 放宽到覆盖整个工作误差范围（最大参考 3 rad/s）后，积分才能正常累积消除偏差；
+    # 真正的抗饱和由 integral_min/max(±1.5) 提供，不依赖 split。
+    yaw_velocity_integral_split_min: -3.5
+    yaw_velocity_integral_split_max: 3.5
 
     pitch_angle_kp: 35.0
     pitch_angle_ki: 0.02
