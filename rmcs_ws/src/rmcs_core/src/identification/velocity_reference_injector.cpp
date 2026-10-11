@@ -66,8 +66,15 @@ public:
         get_parameter_or("arming_delay_s", arming_delay_, 2.0);
 
         get_parameter_or("step_enabled", step_enabled_, true);
-        get_parameter_or("step_from", step_from_, 0.0);
-        get_parameter_or("step_to", step_to_, 1.0);
+        get_parameter_or("step_from", step_from_, 0.0);        // 预载
+        // 连续多级阶跃（staircase）。
+        //   预载 step_from_ 持续 hold_before_ 秒，然后依次跳到
+        //   step_from_+step_delta_*k (k=1..step_count_)，每级 step_hold_s_ 秒。
+        //   step_delta_ 为负即为「先升后降」，可覆盖多个工作点。
+        get_parameter_or("step_to", step_to_, 1.0);            // 兼容旧参数：单级时的目标
+        get_parameter_or("step_count", step_count_, 1);
+        get_parameter_or("step_delta", step_delta_, 0.0);      // 0 -> 用 step_to_ 作单级
+        get_parameter_or("step_hold_s", step_hold_s_, 5.0);    // 每级持续（留给电机响应）
 
         get_parameter_or("sweep_enabled", sweep_enabled_, false);
         get_parameter_or("sweep_start_freq", sweep_start_freq_, 0.5);
@@ -82,6 +89,15 @@ public:
 
         if (!step_enabled_ && !sweep_enabled_)
             throw std::runtime_error("at least one of step_enabled / sweep_enabled must be true");
+        if (step_enabled_) {
+            if (step_count_ < 1)
+                throw std::runtime_error("step_count must be >= 1");
+            if (!(step_hold_s_ > 0.0))
+                throw std::runtime_error("step_hold_s must be > 0");
+            // step_delta 为 0 时退化为单级阶跃（沿用 step_to_）
+            if (step_delta_ == 0.0 && step_count_ == 1)
+                step_delta_ = step_to_ - step_from_;
+        }
         if (!(max_reference_ > 0.0))
             throw std::runtime_error("max_reference must be > 0");
         if (!(hold_before_ >= 0.0) || !(hold_after_ >= 0.0))
@@ -137,9 +153,9 @@ public:
 
         RCLCPP_INFO(
             get_logger(),
-            "velocity reference injector ready: step=%d [%.3f -> %.3f] hold %.2f/%.2f s, "
-            "sweep=%d %.2f->%.2f Hz over %.1f s, csv=%s",
-            static_cast<int>(step_enabled_), step_from_, step_to_, hold_before_, hold_after_,
+            "velocity reference injector ready: step=%d preload=%.3f then %d steps of "
+            "delta=%+.3f every %.2f s; sweep=%d %.2f->%.2f Hz over %.1f s; csv=%s",
+            static_cast<int>(step_enabled_), step_from_, step_count_, step_delta_, step_hold_s_,
             static_cast<int>(sweep_enabled_), sweep_start_freq_, sweep_end_freq_, sweep_duration_,
             csv_path_.c_str());
     }
@@ -258,16 +274,21 @@ private:
     auto run_and_log(double dt) -> double {
         t_ += dt;
 
-        // 参考波形。sweep 优先；否则走 step。
-        //   step_from_  用作激励前的**预载**：让轴脱离静摩擦、进入速度环线性区，
-        //               否则库仑摩擦会把小信号响应吃掉（之前扫频实验的教训）。
+        // 参考波形。sweep 优先；否则走「连续多级阶跃」。
+        //   step_from_ 用作激励前的**预载**：让轴脱离静摩擦、进入速度环线性区
+        //   （库仑摩擦会吃掉小信号响应，这是之前扫频实验的教训）。
+        //   随后每 step_hold_s_ 秒跳一级，共 step_count_ 级。
         double reference = 0.0;
         if (t_ < hold_before_) {
             reference = step_enabled_ ? step_from_ : 0.0;
         } else if (sweep_enabled_) {
             reference = sweep_value(t_ - hold_before_);
         } else {
-            reference = step_to_;
+            const double tau = t_ - hold_before_;
+            int level = static_cast<int>(tau / step_hold_s_);
+            if (level > step_count_)
+                level = step_count_;
+            reference = step_from_ + step_delta_ * static_cast<double>(level);
         }
 
         if (!std::isfinite(reference))
@@ -277,7 +298,9 @@ private:
 
         write_row(t_, reference);
 
-        const double event_span = sweep_enabled_ ? sweep_duration_ : hold_after_;
+        const double event_span =
+            sweep_enabled_ ? sweep_duration_
+                           : (step_enabled_ ? step_hold_s_ * step_count_ : hold_after_);
         if (t_ >= hold_before_ + event_span) {
             RCLCPP_INFO(get_logger(), "INJECTION FINISHED at t=%.4f s (idle)", t_);
             phase_ = Phase::kIdle;
@@ -336,6 +359,9 @@ private:
     bool step_enabled_ = true;
     double step_from_ = 0.0;
     double step_to_ = 1.0;
+    int step_count_ = 1;
+    double step_delta_ = 0.0;
+    double step_hold_s_ = 5.0;
 
     bool sweep_enabled_ = false;
     double sweep_start_freq_ = 0.5;
