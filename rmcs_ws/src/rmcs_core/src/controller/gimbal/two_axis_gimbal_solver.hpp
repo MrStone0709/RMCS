@@ -118,12 +118,42 @@ public:
 
         clamp_yaw_limit(control_direction_yaw_link);
 
+        // 先把【本拍操作用户给出的目标】原样存回，作为下一拍的累加基准。
+        // 注意必须在施加 yaw 目标偏移【之前】存回：注入的偏移只影响本次误差计算，
+        // 不进入累加状态（否则每拍都会累加，变成无限旋转）。
         control_direction_ =
             fast_tf::cast<OdomImu>(yaw_link_to_pitch_link(control_direction_yaw_link, pitch), *tf_);
+
+        // 系统辨识用：给目标 yaw 角叠加一个"仅本拍有效"的偏移。
+        //
+        // 为什么改这里而不是用 SetControlDirection：
+        //   SetControlDirection 要【从头构造】一个世界系绝对方向，必须先知道云台当前
+        //   世界朝向（IMU 系），实测该关系不是常数（含 IMU 漂移与安装姿态），
+        //   猜错就会让误差达到 π 级别 -> 云台全速冲（实测 8.5 rad/s 失控）。
+        //   而 control_direction_ 是求解器自己维护的累加目标，坐标系天然正确；
+        //   在其 yaw 分量上叠加已知偏移即可得到"绝对目标角阶跃"。
+        //
+        // 数学：yaw 误差 = atan2(y, x)。偏移 Δ 时误差变为 err+Δ（atan2 的旋转性质），
+        // 因此"目标角偏移 Δ"精确等效于"误差 +Δ"，无反三角近似误差。
+        //
+        // 默认 yaw_target_offset_ = 0，行为与改动前逐字相同。
+        if (yaw_target_offset_ != 0.0 && std::isfinite(yaw_target_offset_)) {
+            const double c = std::cos(yaw_target_offset_);
+            const double sn = std::sin(yaw_target_offset_);
+            const double x = control_direction_yaw_link->x();
+            const double y = control_direction_yaw_link->y();
+            control_direction_yaw_link->x() = c * x - sn * y;
+            control_direction_yaw_link->y() = sn * x + c * y;
+        }
         return calculate_control_errors(control_direction_yaw_link, pitch);
     }
 
     bool enabled() const { return control_enabled_; }
+
+    /// 设置"仅本拍有效"的 yaw 目标角偏移（rad）。
+    /// 调用方需在每个控制拍重新设置；置 0 即恢复原始行为。
+    /// 用于系统辨识：叠加 Δ 等效于把目标角阶跃 Δ（精确，无近似）。
+    void set_yaw_target_offset(double offset) { yaw_target_offset_ = offset; }
 
     double gimbal_world_pitch() const {
         auto dir =
@@ -230,6 +260,8 @@ private:
     rmcs_executor::Component::InputInterface<double> gimbal_yaw_angle_;
 
     OdomImu::DirectionVector yaw_axis_filtered_{Eigen::Vector3d::UnitZ()};
+    /// 仅本拍有效的 yaw 目标角偏移（见 set_yaw_target_offset）。
+    double yaw_target_offset_ = 0.0;
 
     bool control_enabled_ = false;
     OdomImu::DirectionVector control_direction_;

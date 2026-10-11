@@ -61,9 +61,10 @@ public:
         get_parameter_or("yaw_velocity_command_input", yaw_velocity_command_input_, false);
 
         // 角度环辨识开关（默认 false = 生产行为完全不变）。
-        // true 时若 /gimbal/yaw/angle_command 有有限值，则把它作为**目标角偏移**
-        // 加到求解器给出的角误差上，等效于阶跃目标角，从而激励角度环本身。
-        get_parameter_or("yaw_angle_command_input", yaw_angle_command_input_, false);
+        // true 时若 /gimbal/yaw/angle_target_offset 有有限值，则把它作为
+        // 【目标角偏移】直接叠加到求解器的目标方向上（见
+        // TwoAxisGimbalSolver::set_yaw_target_offset），从而精确地把目标角阶跃该值。
+        get_parameter_or("yaw_angle_target_offset_input", yaw_angle_target_offset_input_, false);
     }
 
 
@@ -85,8 +86,8 @@ public:
                 "yaw injection: velocity_ref enabled=%d bound=%d | angle_offset enabled=%d bound=%d",
                 static_cast<int>(yaw_velocity_command_input_),
                 static_cast<int>(input_.yaw_velocity_command.ready()),
-                static_cast<int>(yaw_angle_command_input_),
-                static_cast<int>(input_.yaw_angle_command.ready()));
+                static_cast<int>(yaw_angle_target_offset_input_),
+                static_cast<int>(input_.yaw_angle_target_offset.ready()));
         }
         const auto switch_right = *input_.switch_right;
         const auto switch_left = *input_.switch_left;
@@ -120,6 +121,14 @@ public:
                                   && input_.auto_aim_control_direction.ready()
                                   && input_.auto_aim_control_direction->allFinite()
                                   && !input_.auto_aim_control_direction->isZero();
+        // 每拍设置一次"目标角偏移"（求解器内部只对本拍有效，不进入累加状态）。
+        // 三重回退：开关关闭 / 无人发布 / 值为 nan 时置 0，行为与改动前逐字相同。
+        if (yaw_angle_target_offset_input_ && input_.yaw_angle_target_offset.ready()
+            && std::isfinite(*input_.yaw_angle_target_offset))
+            gimbal_solver_.set_yaw_target_offset(*input_.yaw_angle_target_offset);
+        else
+            gimbal_solver_.set_yaw_target_offset(0.0);
+
         const auto angle_error =
             auto_aim_active ? update_auto_aim_control() : update_manual_control();
 
@@ -270,14 +279,15 @@ private:
 
         /// 注册 yaw 角度偏移注入输入（角度环辨识用）。同样必须在构造函数体里调用。
         void register_angle_command_input(rmcs_executor::Component& component) {
-            component.register_input("/gimbal/yaw/angle_command", yaw_angle_command, false);
+            // 语义 = **目标角偏移**（rad），不是速率。见 yaw_angle_target_offset_input_.
+            component.register_input("/gimbal/yaw/angle_target_offset", yaw_angle_target_offset, false);
         }
 
         /// yaw 速度参考注入接口，由外部注入组件写入。
         InputInterface<double> yaw_velocity_command;
-        /// yaw 角度偏移注入接口（rad）。加到求解器给出的角误差上，
-        /// 等效于把目标角阶跃一个偏移量，见 update() 中的说明。
-        InputInterface<double> yaw_angle_command;
+        /// yaw 目标角偏移注入接口（rad）。直接加到求解器的【目标角】上，
+        /// 等效于把目标角阶跃该偏移量（精确，无坐标系假设）。
+        InputInterface<double> yaw_angle_target_offset;
 
         InputInterface<Eigen::Vector2d> joystick_left;
         InputInterface<rmcs_msgs::Keyboard> keyboard;
@@ -372,10 +382,10 @@ private:
     ///
     /// 三重回退：开关关闭 / 无人发布 / 值为 nan 时返回 0，行为与改动前逐字相同。
     auto injected_yaw_shift() const -> double {
-        if (!yaw_angle_command_input_ || !input_.yaw_angle_command.ready()
-            || !std::isfinite(*input_.yaw_angle_command))
-            return 0.0;
-        return *input_.yaw_angle_command;
+        // 【已停用】原"速率注入"路径。改为 set_yaw_target_offset 的目标角偏移注入：
+        //   速率注入是斜坡（目标角持续累积），而 target offset 是精确的角阶跃，
+        //   且不依赖坐标系。这里恒返回 0 以便随时回退对比。
+        return 0.0;
     }
 
     auto auto_aim_requested() const -> bool {
@@ -574,8 +584,8 @@ private:
     bool yaw_velocity_command_input_ = false;
     bool velocity_command_reported_ = false;
 
-    /// yaw 角度偏移注入开关。默认 false：角度环输入完全来自求解器，生产行为不变。
-    bool yaw_angle_command_input_ = false;
+    /// yaw 目标角偏移注入开关。默认 false：目标角完全来自求解器累加，生产行为不变。
+    bool yaw_angle_target_offset_input_ = false;
 
     bool pitch_lock_active_ = false;
     bool suspension_on_by_switch_ = false;

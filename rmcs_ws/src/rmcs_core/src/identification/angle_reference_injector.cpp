@@ -53,6 +53,11 @@ public:
         get_parameter_or("csv_path", csv_path_, std::string{"/tmp/angle_command.csv"});
         get_parameter_or("hold_before_s", hold_before_, 2.0);
         get_parameter_or("hold_after_s", hold_after_, 1.0);
+        // 结束时的斜坡淡出时长（s）。**必须有**：目标角偏移若从最终值阶跃回 0，
+        // 云台会以极高速度回退该角度（实测 offset=0.60 时回退冲击严重，
+        // kp=35 下速度参考可达 35*0.6=21 rad/s），即"失控高速旋转"。
+        // 用线性淡出把回退速度限制在 offset/ramp_down_s 以内。
+        get_parameter_or("ramp_down_s", ramp_down_s_, 2.0);
         get_parameter_or("arming_delay_s", arming_delay_, 2.0);
 
         get_parameter_or("step_enabled", step_enabled_, true);
@@ -77,6 +82,8 @@ public:
             throw std::runtime_error("max_command must be > 0");
         if (!(hold_before_ >= 0.0) || !(hold_after_ >= 0.0))
             throw std::runtime_error("hold_before_s / hold_after_s must be >= 0");
+        if (!(ramp_down_s_ > 0.0))
+            throw std::runtime_error("ramp_down_s must be > 0");
         if (step_enabled_) {
             if (step_count_ < 1)
                 throw std::runtime_error("step_count must be >= 1");
@@ -93,7 +100,9 @@ public:
         }
 
         // ---- 接口注册（必须在构造函数体，见执行器注册规则说明）----------
-        register_output("/gimbal/yaw/angle_command", angle_command_, kNaN);
+        // 语义 = yaw **目标角偏移**（rad），叠加到求解器的目标角上。
+        // 与旧的 "angle_command 速率注入" 相比：这里是精确角阶跃，且不依赖世界坐标系。
+        register_output("/gimbal/yaw/angle_target_offset", angle_command_, kNaN);
         register_input("/remote/switch/left", switch_left_, false);
         register_input("/remote/switch/right", switch_right_, false);
         register_input("/predefined/update_rate", update_rate_, false);
@@ -103,6 +112,10 @@ public:
         register_input("/gimbal/yaw/torque", measured_torque_, false);
         register_input("/gimbal/yaw/temperature", measured_temperature_, false);
         register_input("/gimbal/yaw/max_torque", measured_max_torque_, false);
+        // pitch 监测（kp 调高后需确认 yaw 未把 pitch 带偏）
+        register_input("/gimbal/pitch/angle", measured_pitch_angle_, false);
+        register_input("/gimbal/pitch/velocity_imu", measured_pitch_velocity_, false);
+        register_input("/gimbal/pitch/torque", measured_pitch_torque_, false);
 
         csv_file_.open(csv_path_, std::ios::out | std::ios::trunc);
         if (!csv_file_.is_open())
@@ -114,7 +127,10 @@ public:
                   << "/gimbal/yaw/velocity,"
                   << "/gimbal/yaw/torque,"
                   << "/gimbal/yaw/temperature,"
-                  << "/gimbal/yaw/max_torque\n";
+                  << "/gimbal/yaw/max_torque,"
+                  << "/gimbal/pitch/angle,"
+                  << "/gimbal/pitch/velocity_imu,"
+                  << "/gimbal/pitch/torque\n";
 
         RCLCPP_INFO(
             get_logger(),
@@ -247,16 +263,28 @@ private:
             command = 0.0;
         command = std::clamp(command, -max_command_, max_command_);
 
-        write_row(t_, command);
-
         const double event_span =
             sweep_enabled_ ? sweep_duration_
                            : (step_enabled_ ? step_hold_s_ * step_count_ : hold_after_);
-        if (t_ >= hold_before_ + event_span) {
-            RCLCPP_INFO(get_logger(), "ANGLE INJECTION FINISHED at t=%.4f s (idle)", t_);
-            phase_ = Phase::kIdle;
-            csv_file_.flush();
+        const double event_end = hold_before_ + event_span;
+
+        // 结束阶段：把 command 线性淡出到 0，避免目标角偏移阶跃回零造成回退冲击。
+        const double ramp_begin = event_end - hold_after_;
+        if (t_ >= ramp_begin) {
+            const double progress = (t_ - ramp_begin) / ramp_down_s_;
+            if (progress >= 1.0) {
+                RCLCPP_INFO(
+                    get_logger(), "ANGLE INJECTION FINISHED at t=%.4f s (ramp-down complete)",
+                    t_);
+                write_row(t_, 0.0);
+                phase_ = Phase::kIdle;
+                csv_file_.flush();
+                return 0.0;
+            }
+            command *= (1.0 - progress); // 线性淡出
         }
+
+        write_row(t_, command);
         return command;
     }
 
@@ -281,7 +309,10 @@ private:
                   << value_or_nan(measured_angle_) << "," << value_or_nan(measured_velocity_imu_)
                   << "," << value_or_nan(measured_velocity_) << ","
                   << value_or_nan(measured_torque_) << "," << value_or_nan(measured_temperature_)
-                  << "," << value_or_nan(measured_max_torque_) << "\n";
+                  << "," << value_or_nan(measured_max_torque_) << ","
+                  << value_or_nan(measured_pitch_angle_) << ","
+                  << value_or_nan(measured_pitch_velocity_) << ","
+                  << value_or_nan(measured_pitch_torque_) << "\n";
         if (++flush_tick_ >= 100) {
             flush_tick_ = 0;
             csv_file_.flush();
@@ -298,6 +329,7 @@ private:
     // ---- 参数 ----
     std::string csv_path_{"/tmp/angle_command.csv"};
     double hold_before_ = 2.0, hold_after_ = 1.0, arming_delay_ = 2.0;
+    double ramp_down_s_ = 2.0; // 结束时的斜坡淡出时长（见构造函数说明）
     bool step_enabled_ = true;
     double step_from_ = 0.0, step_delta_ = 0.0, step_hold_s_ = 5.0;
     int step_count_ = 1;
@@ -321,6 +353,9 @@ private:
     rmcs_executor::Component::InputInterface<double> measured_angle_, measured_velocity_,
         measured_velocity_imu_, measured_torque_, measured_temperature_, measured_max_torque_;
 
+    InputInterface<double> measured_pitch_angle_;
+    InputInterface<double> measured_pitch_velocity_;
+    InputInterface<double> measured_pitch_torque_;
     std::ofstream csv_file_;
 };
 
