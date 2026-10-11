@@ -91,6 +91,14 @@ public:
         const auto switch_right = *input_.switch_right;
         const auto switch_left = *input_.switch_left;
         const auto keyboard = *input_.keyboard;
+        // 诊断（临时）：确认 update() 在跑 + 开关状态 + 各开关量
+        RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "[DIAG-ENTRY] L=%d R=%d yaw_en=%d vel_inj=%d vc_ready=%d vc=%.4f", (int)switch_left,
+            (int)switch_right, static_cast<int>(yaw_control_enabled_),
+            static_cast<int>(yaw_velocity_command_input_),
+            static_cast<int>(input_.yaw_velocity_command.ready()),
+            input_.yaw_velocity_command.ready() ? *input_.yaw_velocity_command : -999.0);
 
         using namespace rmcs_msgs;
         if ((switch_left == Switch::UNKNOWN || switch_right == Switch::UNKNOWN)
@@ -151,15 +159,35 @@ public:
                 // 一旦切回非注入模式就会把残余积分量猛地加到速度参考上。
                 yaw_angle_pid_.reset();
                 const auto yaw_velocity_ref = *input_.yaw_velocity_command;
+                const auto yaw_vel_err = yaw_velocity_ref - *input_.yaw_velocity_imu;
+                const auto yaw_vel_out = yaw_velocity_pid_.update(yaw_vel_err);
                 *output_.yaw_control_torque =
-                    yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
-                    + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+                    yaw_vel_out + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+                // 诊断（临时，验证完可删）：打印速度环内部真实量
+                RCLCPP_INFO_THROTTLE(
+                    get_logger(), *get_clock(), 200,
+                    "[DIAG-VEL] ref=%.5f v_imu=%.5f err=%.5f pid_out=%.5f (kp*err=%.5f) "
+                    "ff_v=%.5f ff_a=%.5f total=%.5f | motor_v=%.5f tau=%.5f",
+                    yaw_velocity_ref, *input_.yaw_velocity_imu, yaw_vel_err, yaw_vel_out,
+                    yaw_velocity_pid_.kp * yaw_vel_err, trajectory_ff.yaw_velocity,
+                    trajectory_ff.yaw_acceleration, *output_.yaw_control_torque,
+                    input_.yaw_motor_velocity.ready() ? *input_.yaw_motor_velocity : -999.0,
+                    input_.yaw_motor_torque.ready() ? *input_.yaw_motor_torque : -999.0);
             } else {
                 const auto yaw_velocity_ref = yaw_angle_pid_.update(angle_error.yaw_angle_error)
                                             + trajectory_ff.yaw_ref_velocity;
+                const auto yaw_vel_err = yaw_velocity_ref - *input_.yaw_velocity_imu;
+                const auto yaw_vel_out = yaw_velocity_pid_.update(yaw_vel_err);
                 *output_.yaw_control_torque =
-                    yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
-                    + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+                    yaw_vel_out + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+                RCLCPP_INFO_THROTTLE(
+                    get_logger(), *get_clock(), 200,
+                    "[DIAG-ANG] ang_err=%.5f v_ref=%.5f v_imu=%.5f err=%.5f pid_out=%.5f "
+                    "(kp*err=%.5f) motor_v=%.5f tau=%.5f",
+                    angle_error.yaw_angle_error, yaw_velocity_ref, *input_.yaw_velocity_imu,
+                    yaw_vel_err, yaw_vel_out, yaw_velocity_pid_.kp * yaw_vel_err,
+                    input_.yaw_motor_velocity.ready() ? *input_.yaw_motor_velocity : -999.0,
+                    input_.yaw_motor_torque.ready() ? *input_.yaw_motor_torque : -999.0);
             }
         }
 
@@ -215,6 +243,9 @@ private:
 
             component.register_input("/gimbal/pitch/angle", pitch_angle);
             component.register_input("/gimbal/yaw/velocity_imu", yaw_velocity_imu);
+            // 诊断用（只读硬件输出，不构成循环依赖）
+            component.register_input("/gimbal/yaw/velocity", yaw_motor_velocity, false);
+            component.register_input("/gimbal/yaw/torque", yaw_motor_torque, false);
             component.register_input("/gimbal/pitch/velocity_imu", pitch_velocity_imu);
 
             component.register_input("/auto_aim/should_control", auto_aim_should_control, false);
@@ -258,6 +289,8 @@ private:
 
         InputInterface<double> pitch_angle;
         InputInterface<double> yaw_velocity_imu;
+        InputInterface<double> yaw_motor_velocity;
+        InputInterface<double> yaw_motor_torque;
         InputInterface<double> pitch_velocity_imu;
 
         InputInterface<bool> auto_aim_should_control;
