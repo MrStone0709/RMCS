@@ -2,38 +2,64 @@ rmcs_executor:
   ros__parameters:
     update_rate: 1000.0
     components:
+      # ---- 硬件层（必需）-----------------------------------------------------
+      # 唯一提供 /gimbal/yaw/* 与 /gimbal/pitch/* 反馈，也是云台两个电机的驱动者。
       - rmcs_core::hardware::DeformableInfantryOmniC -> deformable_infantry
 
+      # ---- 裁判系统 ----------------------------------------------------------
+      # [必需] 不能关！硬件内部的超级电容(Supercap)把 /referee/chassis/output_status
+      #        注册为 required 输入（hardware/device/supercap.hpp:31），
+      #        唯一发布者就是本组件（referee/status.cpp:51）。
+      #        关掉它 → 启动即报 "Cannot find /referee/chassis/output_status"。
+      #        它只需要 /referee/serial（硬件提供）。
       - rmcs_core::referee::Status -> referee_status
-      - rmcs_core::referee::Command -> referee_command
 
-      - rmcs_core::referee::command::Interaction -> referee_interaction
-      - rmcs_core::referee::command::interaction::Ui -> referee_ui
-      - rmcs_core::referee::app::ui::DeformableInfantry -> referee_ui_infantry
+      # [已关闭] 裁判系统发命令 + 操作手 UI，与云台无关。
+      # - rmcs_core::referee::Command -> referee_command
+      # - rmcs_core::referee::command::Interaction -> referee_interaction
+      # - rmcs_core::referee::command::interaction::Ui -> referee_ui
+      # - rmcs_core::referee::app::ui::DeformableInfantry -> referee_ui_infantry
 
+      # ---- 云台控制器（必需）-------------------------------------------------
+      # 负责 pitch 支路（含重力前馈与自动找平）。
       - rmcs_core::controller::gimbal::DeformableInfantryGimbalController -> gimbal_controller
 
-      - rmcs_core::controller::shooting::FrictionWheelController -> friction_wheel_controller
-      - rmcs_core::controller::shooting::HeatController -> heat_controller
-      - rmcs_core::controller::shooting::BulletFeederController17mm -> bullet_feeder_controller
-      - rmcs_core::controller::pid::PidController -> left_friction_velocity_pid_controller
-      - rmcs_core::controller::pid::PidController -> right_friction_velocity_pid_controller
-      - rmcs_core::controller::pid::PidController -> bullet_feeder_velocity_pid_controller
+      # ---- 发射机构 [已关闭] -------------------------------------------------
+      # 与云台无关；关掉可避免发射机构意外动作，也更安全。
+      # - rmcs_core::controller::shooting::FrictionWheelController -> friction_wheel_controller
+      # - rmcs_core::controller::shooting::HeatController -> heat_controller
+      # - rmcs_core::controller::shooting::BulletFeederController17mm -> bullet_feeder_controller
+      # - rmcs_core::controller::pid::PidController -> left_friction_velocity_pid_controller
+      # - rmcs_core::controller::pid::PidController -> right_friction_velocity_pid_controller
+      # - rmcs_core::controller::pid::PidController -> bullet_feeder_velocity_pid_controller
 
+      # ---- 底盘 --------------------------------------------------------------
+      # 姿态/限幅管理，是 suspension 的 required 输入来源（缺一会启动失败）。
       - rmcs_core::controller::chassis::DeformableChassis -> chassis_controller
+      # 腿姿态控制器：发布四条腿的目标角/角速度给关节控制器。
       - rmcs_core::controller::chassis::DeformableSuspension -> deformable_suspension
+      # [必需] 不能关！超电把 /chassis/supercap/charge_power_limit 注册为 required
+      #        输入（supercap.hpp:32），唯一发布者就是本组件
+      #        （chassis_power_controller.cpp:38）。
       - rmcs_core::controller::chassis::ChassisPowerController -> chassis_power_controller
-      - rmcs_core::controller::chassis::DeformableOmniWheelController -> deformable_chassis_controller
 
-      - rmcs_core::controller::chassis::DeformableJointController -> lf_joint_controller
-      - rmcs_core::controller::chassis::DeformableJointController -> lb_joint_controller
-      - rmcs_core::controller::chassis::DeformableJointController -> rb_joint_controller
-      - rmcs_core::controller::chassis::DeformableJointController -> rf_joint_controller
+      # [已关闭] 全向轮速度闭环：关掉后轮子不被驱动，底盘不会自己走。
+      # - rmcs_core::controller::chassis::DeformableOmniWheelController -> deformable_chassis_controller
 
-      - rmcs::AutoAimRecorderComponent -> auto_aim_recorder
-      - rmcs::AutoAimComponent -> auto_aim_component
-      - rmcs::AutoAimCapturerComponent -> auto_aim_capturer
-      - rmcs_core::referee::app::ui::AutoAimUi -> auto_aim_ui
+      # ---- 四条腿的关节闭环 --------------------------------------------------
+      # [保留] 腿有保持力矩 → 底盘正常支撑 → 枪管不会被车体挡住、pitch 能正常找平。
+      #        （实测：关掉这四个会让底盘趴地、枪管压车体，pitch 无法到水平）
+      # rmcs_core::controller::chassis::DeformableJointController -> lf_joint_controller
+      # rmcs_core::controller::chassis::DeformableJointController -> lb_joint_controller
+      # rmcs_core::controller::chassis::DeformableJointController -> rb_joint_controller
+      # rmcs_core::controller::chassis::DeformableJointController -> rf_joint_controller
+
+      # ---- 自瞄 [已关闭] -----------------------------------------------------
+      # 占摄像头 + 约 6 个 CPU 核，会抬高执行器抖动。与云台辨识无关。
+      # - rmcs::AutoAimRecorderComponent -> auto_aim_recorder
+      # - rmcs::AutoAimComponent -> auto_aim_component
+      # - rmcs::AutoAimCapturerComponent -> auto_aim_capturer
+      # - rmcs_core::referee::app::ui::AutoAimUi -> auto_aim_ui
 
       # - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
       # - rmcs_core::debug::ValueCollector -> value_collector
@@ -115,7 +141,7 @@ deformable_infantry:
     chassis_radius: 0.2341741
     rod_length: 0.140
     yaw_motor_zero_point: 38910
-    pitch_motor_zero_point: 32214
+    pitch_motor_zero_point: 7093
 
 chassis_controller:
   ros__parameters:

@@ -42,9 +42,61 @@ public:
         get_parameter_or("pitch_velocity_ff_gain", pitch_velocity_ff_gain_, 0.0);
         get_parameter_or("pitch_acceleration_ff_gain", pitch_acceleration_ff_gain_, 0.0);
         get_parameter_or("ctrl_hold_pitch_target_angle", ctrl_hold_pitch_target_angle_, 0.0);
+
+        // 辨识/测试开关：对应轴为 false 时，本组件完全让出该轴的全部输出，
+        // 交给辨识组件（SweptFrequencyController / StepResponseController）独占。
+        // 必须在函数体里读，且只有在为 true 时才注册接口（见 Output 注释）。
+        // 默认都是 true，生产行为完全不变。
+        get_parameter_or("yaw_control_enabled", yaw_control_enabled_, true);
+        get_parameter_or("pitch_control_enabled", pitch_control_enabled_, true);
+        output_.register_outputs(*this, yaw_control_enabled_, pitch_control_enabled_);
+
+        // 速度参考注入开关（默认 false = 生产行为完全不变）。
+        //
+        // 用途：系统辨识需要在**不改变速度环本身**的前提下，给 yaw 速度环一个
+        // 可直接编程的参考值（阶跃/扫频），而不是靠摇杆或角度环产生。
+        //   false -> yaw 速度参考仍由角度环产生（原行为）
+        //   true  -> 若 /gimbal/yaw/control_velocity 有发布者且数值有限，
+        //            则直接把它当速度参考；否则回退到角度环输出，不会失控。
+        get_parameter_or("yaw_velocity_command_input", yaw_velocity_command_input_, false);
+        RCLCPP_INFO(
+            get_logger(), "[DIAG-REG-IN] active=%d ready=%d",
+            static_cast<int>(input_.yaw_velocity_command.active()),
+            static_cast<int>(input_.yaw_velocity_command.ready()));
+
+        // 临时诊断：打印 yaw 速度环的真实限幅与增益。
+        // 背景：配置里没有 yaw_velocity_output_min/max，而 configure_pid 用的是
+        // 不带默认值的 get_parameter。需要确认这里到底取到了什么值。
+        RCLCPP_INFO(
+            get_logger(),
+            "[DIAG] yaw_velocity kp=%.4f ki=%.4f out=[%.6f,%.6f] int=[%.6f,%.6f] "
+            "split=[%.6f,%.6f] yaw_vel_cmd_input=%d",
+            yaw_velocity_pid_.kp, yaw_velocity_pid_.ki, yaw_velocity_pid_.output_min,
+            yaw_velocity_pid_.output_max, yaw_velocity_pid_.integral_min,
+            yaw_velocity_pid_.integral_max, yaw_velocity_pid_.integral_split_min,
+            yaw_velocity_pid_.integral_split_max, static_cast<int>(yaw_velocity_command_input_));
+    }
+
+
+    /// 输入接口在 before_pairing 里注册：这是执行器规定"可注册/可配对"的钩子，
+    /// 且它在本组件的 OutputInfoMap 可用之后、配对循环之前被调用。
+    auto before_pairing(const OutputInfoMap& output_map) -> void override {
+        (void)output_map;
+        input_.register_velocity_command_input(*this);
+        RCLCPP_INFO(
+            get_logger(), "[DIAG-REG-IN-BP] active=%d ready=%d",
+            static_cast<int>(input_.yaw_velocity_command.active()),
+            static_cast<int>(input_.yaw_velocity_command.ready()));
     }
 
     auto update() -> void override {
+        if (!pairing_checked_) {
+            pairing_checked_ = true;
+            RCLCPP_INFO(
+                get_logger(), "[DIAG-PAIR] after pairing: active=%d ready=%d",
+                static_cast<int>(input_.yaw_velocity_command.active()),
+                static_cast<int>(input_.yaw_velocity_command.ready()));
+        }
         const auto switch_right = *input_.switch_right;
         const auto switch_left = *input_.switch_left;
         const auto keyboard = *input_.keyboard;
@@ -72,25 +124,69 @@ public:
         const auto angle_error =
             auto_aim_active ? update_auto_aim_control() : update_manual_control();
 
-        *output_.yaw_angle_error = angle_error.yaw_angle_error;
-        if (!ctrl_hold_active_)
+        // 扫频辨识用开关：false 时 yaw 支路整体让给
+        // rmcs_core::controller::identification::SweptFrequencyController
+        // （由它独占 /gimbal/yaw/control_torque），本组件只保留 pitch 支路。
+        // 默认 true，生产行为完全不变。
+        if (yaw_control_enabled_) {
+            *output_.yaw_angle_error = angle_error.yaw_angle_error;
+        } else {
+            yaw_angle_pid_.reset();
+            yaw_velocity_pid_.reset();
+        }
+        if (!ctrl_hold_active_ && pitch_control_enabled_)
             *output_.pitch_angle_error = angle_error.pitch_angle_error;
 
         const auto trajectory_ff = trajectory_feedforward(auto_aim_active);
 
-        if (!std::isfinite(angle_error.yaw_angle_error)) {
-            yaw_angle_pid_.reset();
-            yaw_velocity_pid_.reset();
-            *output_.yaw_control_torque = kNaN;
-        } else {
-            const auto yaw_velocity_ref = yaw_angle_pid_.update(angle_error.yaw_angle_error)
-                                        + trajectory_ff.yaw_ref_velocity;
-            *output_.yaw_control_torque =
-                yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
-                + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+        if (yaw_control_enabled_) {
+            // 速度参考注入：只在开关打开、且外部确实给出了有限值时生效。
+            // 构造上保证「不注入时行为与原来逐字相同」：
+            //   注入关闭            -> 走 else 分支，与改动前完全一致；
+            //   注入开启但无人发布  -> yaw_velocity_command.ready() 为 false，回退；
+            //   注入开启但值为 nan  -> std::isfinite 为 false，回退。
+            // 三种回退都不会让速度环失去参考而失控。
+            const bool vc_ready = input_.yaw_velocity_command.ready();
+            const bool vc_finite = vc_ready && std::isfinite(*input_.yaw_velocity_command);
+            const bool inject = yaw_velocity_command_input_ && vc_ready && vc_finite;
+            // 临时诊断：三个条件分别是什么
+            RCLCPP_INFO_THROTTLE(
+                get_logger(), *get_clock(), 500,
+                "[DIAG-COND] flag=%d ready=%d finite=%d inject=%d raw=%.4f",
+                static_cast<int>(yaw_velocity_command_input_), static_cast<int>(vc_ready),
+                static_cast<int>(vc_finite), static_cast<int>(inject),
+                vc_ready ? *input_.yaw_velocity_command : -999.0);
+
+            if (!std::isfinite(angle_error.yaw_angle_error)) {
+                yaw_angle_pid_.reset();
+                yaw_velocity_pid_.reset();
+                *output_.yaw_control_torque = kNaN;
+            } else if (inject) {
+                // 注入模式：角度环退出，直接采用外部速度参考。
+                // 必须 reset 角度 PID，否则它会在旁边持续积分、状态发散，
+                // 一旦切回非注入模式就会把残余积分量猛地加到速度参考上。
+                yaw_angle_pid_.reset();
+                const auto yaw_velocity_ref = *input_.yaw_velocity_command;
+                // 临时诊断：确认注入分支真的在跑、以及误差的量级
+                RCLCPP_INFO_THROTTLE(
+                    get_logger(), *get_clock(), 500,
+                    "[DIAG-INJ] ref=%.4f v_imu=%.5f err=%.4f ctl=%.4f",
+                    yaw_velocity_ref, *input_.yaw_velocity_imu,
+                    yaw_velocity_ref - *input_.yaw_velocity_imu,
+                    yaw_velocity_pid_.kp * (yaw_velocity_ref - *input_.yaw_velocity_imu));
+                *output_.yaw_control_torque =
+                    yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
+                    + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+            } else {
+                const auto yaw_velocity_ref = yaw_angle_pid_.update(angle_error.yaw_angle_error)
+                                            + trajectory_ff.yaw_ref_velocity;
+                *output_.yaw_control_torque =
+                    yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
+                    + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
+            }
         }
 
-        if (!ctrl_hold_active_) {
+        if (pitch_control_enabled_ && !ctrl_hold_active_) {
             if (!std::isfinite(angle_error.pitch_angle_error)) {
                 pitch_angle_pid_.reset();
                 pitch_velocity_pid_.reset();
@@ -149,7 +245,23 @@ private:
                 "/auto_aim/control_direction", auto_aim_control_direction, false);
             component.register_input("/auto_aim/ff_v", auto_aim_ff_v, false);
             component.register_input("/auto_aim/ff_a", auto_aim_ff_a, false);
+
         }
+
+        /// 注册 yaw 速度参考注入输入。
+        ///
+        /// 为什么放在这里（成员函数）而不是 Input 构造里就注册：
+        ///   与 Output 同样的坑 —— Input 是嵌套结构体，其构造函数在**外层构造函数
+        ///   体之前**执行。在外层构造函数体里调用本方法注册，时机明确、与其它
+        ///   组件一致，避免出现"注册了 active=1 但配对时找不到"的现象。
+        void register_velocity_command_input(rmcs_executor::Component& component) {
+            // 注册为【非必需】：没有发布者时不会阻塞配对，ready() 返回 false，
+            // 本组件自动回退到角度环参考，行为与改动前一致。
+            component.register_input("/gimbal/yaw/velocity_command", yaw_velocity_command, false);
+        }
+
+        /// yaw 速度参考注入接口，由外部注入组件写入。
+        InputInterface<double> yaw_velocity_command;
 
         InputInterface<Eigen::Vector2d> joystick_left;
         InputInterface<rmcs_msgs::Keyboard> keyboard;
@@ -171,14 +283,34 @@ private:
 
     struct Output {
         explicit Output(rmcs_executor::Component& component) {
-            component.register_output("/gimbal/yaw/control_torque", yaw_control_torque, kNaN);
-            component.register_output("/gimbal/yaw/control_angle", yaw_control_angle, kNaN);
-            component.register_output(
-                "/gimbal/pitch/control_velocity", pitch_control_velocity, kNaN);
-            component.register_output("/gimbal/pitch/control_torque", pitch_control_torque, kNaN);
-            component.register_output("/gimbal/pitch/control_angle", pitch_control_angle, kNaN);
-            component.register_output("/gimbal/yaw/control_angle_error", yaw_angle_error, kNaN);
-            component.register_output("/gimbal/pitch/control_angle_error", pitch_angle_error, kNaN);
+            // 这里【不】注册任何接口：所有输出都按需在构造函数体里注册
+            // （见 register_outputs）。原因见下方注释。
+            (void)component;
+        }
+
+        /// 由构造函数体调用，按开关注册各轴接口。
+        ///
+        /// 为什么不在本结构体的初始化器里注册：
+        ///   嵌套类的成员初始化器属于"完整类上下文"，会在外层构造函数体之前求值。
+        ///   那时 yaw_control_enabled_ / pitch_control_enabled_ 尚未从参数读取，
+        ///   只会读到未初始化值（实测垃圾值 51），导致开关完全失效、并触发
+        ///   "Duplicate Normal output" 启动崩溃。
+        void register_outputs(
+            rmcs_executor::Component& component, bool yaw_enabled, bool pitch_enabled) {
+            if (yaw_enabled) {
+                component.register_output("/gimbal/yaw/control_torque", yaw_control_torque, kNaN);
+                component.register_output("/gimbal/yaw/control_angle", yaw_control_angle, kNaN);
+                component.register_output("/gimbal/yaw/control_angle_error", yaw_angle_error, kNaN);
+            }
+            if (pitch_enabled) {
+                component.register_output(
+                    "/gimbal/pitch/control_velocity", pitch_control_velocity, kNaN);
+                component.register_output(
+                    "/gimbal/pitch/control_torque", pitch_control_torque, kNaN);
+                component.register_output("/gimbal/pitch/control_angle", pitch_control_angle, kNaN);
+                component.register_output(
+                    "/gimbal/pitch/control_angle_error", pitch_angle_error, kNaN);
+            }
         }
 
         OutputInterface<double> yaw_control_torque;
@@ -285,17 +417,21 @@ private:
         ctrl_hold_active_ = false;
         pitch_angle_pid_.reset();
         pitch_velocity_pid_.reset();
-        *output_.pitch_control_angle = kNaN;
+        if (pitch_control_enabled_)
+            *output_.pitch_control_angle = kNaN;
     }
 
     auto update_ctrl_hold_control() -> void {
         if (!ctrl_hold_active_)
             activate_ctrl_hold();
 
-        *output_.yaw_control_angle = kNaN;
-        *output_.pitch_control_velocity = kNaN;
-        *output_.pitch_control_torque = kNaN;
-        *output_.pitch_control_angle = kNaN;
+        if (yaw_control_enabled_)
+            *output_.yaw_control_angle = kNaN;
+        if (pitch_control_enabled_) {
+            *output_.pitch_control_velocity = kNaN;
+            *output_.pitch_control_torque = kNaN;
+            *output_.pitch_control_angle = kNaN;
+        }
 
         if (input_.pitch_angle.ready() && std::isfinite(*input_.pitch_angle)) {
             auto pitch_target_error = ctrl_hold_pitch_target_angle_ - *input_.pitch_angle;
@@ -324,11 +460,15 @@ private:
         yaw_velocity_pid_.reset();
         pitch_angle_pid_.reset();
         pitch_velocity_pid_.reset();
-        *output_.yaw_control_torque = kNaN;
-        *output_.yaw_control_angle = kNaN;
-        *output_.pitch_control_velocity = kNaN;
-        *output_.pitch_control_torque = kNaN;
-        *output_.pitch_control_angle = kNaN;
+        if (yaw_control_enabled_) {
+            *output_.yaw_control_torque = kNaN;
+            *output_.yaw_control_angle = kNaN;
+        }
+        if (pitch_control_enabled_) {
+            *output_.pitch_control_velocity = kNaN;
+            *output_.pitch_control_torque = kNaN;
+            *output_.pitch_control_angle = kNaN;
+        }
     }
 
     auto reset_all_controls() -> void {
@@ -337,8 +477,10 @@ private:
         suspension_on_by_switch_ = false;
         last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
         gimbal_solver_.update(TwoAxisGimbalSolver::SetDisabled{});
-        *output_.yaw_angle_error = kNaN;
-        *output_.pitch_angle_error = kNaN;
+        if (yaw_control_enabled_)
+            *output_.yaw_angle_error = kNaN;
+        if (pitch_control_enabled_)
+            *output_.pitch_angle_error = kNaN;
         reset_control_outputs();
     }
 
@@ -378,6 +520,18 @@ private:
     double yaw_acceleration_ff_gain_ = 0.0;
     double pitch_velocity_ff_gain_ = 0.0;
     double pitch_acceleration_ff_gain_ = 0.0;
+    /// 辨识/测试开关。默认 true = 生产行为（本组件负责该轴）。
+    /// false = 该轴全部输出让给辨识组件（SweptFrequencyController /
+    /// StepResponseController），本组件不再注册、也不再写该轴任何接口。
+    bool yaw_control_enabled_ = true;
+    bool pitch_control_enabled_ = true;
+
+    /// yaw 速度参考注入开关。默认 false：yaw 速度参考仍由角度环产生，生产行为不变。
+    /// true 时若 /gimbal/yaw/control_velocity 有有限值，则直接用它作为速度参考，
+    /// 用于在不改动速度环的前提下做阶跃/扫频辨识。详见构造函数注释。
+    bool yaw_velocity_command_input_ = false;
+    bool pairing_checked_ = false;
+
     bool pitch_lock_active_ = false;
     bool suspension_on_by_switch_ = false;
     rmcs_msgs::Switch last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;

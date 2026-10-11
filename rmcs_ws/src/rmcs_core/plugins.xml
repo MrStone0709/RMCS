@@ -65,5 +65,7 @@
 
   <class type="rmcs_core::controller::identification::StaticTorqueTestController" base_class_type="rmcs_executor::Component" />
   <class type="rmcs_core::controller::identification::SweptFrequencyController" base_class_type="rmcs_executor::Component" />
+  <class type="rmcs_core::controller::identification::StepResponseController" base_class_type="rmcs_executor::Component" />
+  <class type="rmcs_core::controller::identification::VelocityReferenceInjector" base_class_type="rmcs_executor::Component" />
   <class type="rmcs_core::test::output::AngleOutput" base_class_type="rmcs_executor::Component" />
 </library>
