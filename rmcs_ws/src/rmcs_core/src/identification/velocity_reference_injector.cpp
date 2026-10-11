@@ -58,11 +58,8 @@ public:
     VelocityReferenceInjector()
         : Node(
               get_component_name(),
-              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {}
-
-    auto before_pairing(const OutputInfoMap& output_map) -> void override {
-        (void)output_map;
-
+              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {
+        // 参数可在此安全读取：rclcpp::Node 基类已构造完毕。
         get_parameter_or("csv_path", csv_path_, std::string{"/tmp/velocity_reference.csv"});
         get_parameter_or("hold_before_s", hold_before_, 1.0);
         get_parameter_or("hold_after_s", hold_after_, 2.5);
@@ -98,25 +95,33 @@ public:
                 throw std::runtime_error("sweep_duration_s must be > 0");
         }
 
-        // 输出：速度参考
+        // ---- 接口注册 -------------------------------------------------------
+        // 【关键】必须在本构造函数体里注册，不能放到 before_pairing。
+        // 执行器 init() 的顺序是：
+        //   1) 遍历所有组件的 output_list_ / input_list_ 建立 output_map
+        //   2) 调用各组件的 before_pairing(user_output_map)
+        //   3) 遍历 input_list_ 做绑定（output_map.find）
+        // output_map 在 before_pairing 之前就已定型，所以在 before_pairing 里
+        // register_output 的输出【不会】进入 output_map；消费方的输入会 find 失败，
+        // 而 required=false 的输入会被静默跳过（表现为 ready() 永远 false、无任何报错）。
+        // （输入在 before_pairing 里注册没问题，因为绑定是第 3 步才做的 ——
+        //   ValueCollector 就是这么用的。）
         register_output("/gimbal/yaw/velocity_command", control_velocity_, kNaN);
-        RCLCPP_INFO(get_logger(), "[DIAG-REG-OUT] registered /gimbal/yaw/velocity_command");
-
-        // 触发与时间基准
         register_input("/remote/switch/left", switch_left_, false);
         register_input("/remote/switch/right", switch_right_, false);
         register_input("/predefined/update_rate", update_rate_, false);
-
-        // 录制信号（全部非必需）。
-        // 速度环的"输出"用实测力矩 / torque 反映；速度环输入是 velocity_imu。
         register_input("/gimbal/yaw/velocity", measured_velocity_, false);
         register_input("/gimbal/yaw/velocity_imu", measured_velocity_imu_, false);
         register_input("/gimbal/yaw/torque", measured_torque_, false);
         register_input("/gimbal/yaw/angle", measured_angle_, false);
         register_input("/gimbal/yaw/temperature", measured_temperature_, false);
         register_input("/gimbal/yaw/max_torque", measured_max_torque_, false);
-        // gimbal_controller 在该模式下算出的力矩（即速度环输出），用于对照
-        register_input("/gimbal/yaw/control_torque", ctrl_control_torque_, false);
+        // 注意：这里【不能】读 /gimbal/yaw/control_torque 或 control_angle_error。
+        // 本组件给 gimbal_controller 提供 /gimbal/yaw/velocity_command，若再去读
+        // gimbal_controller 的输出就构成循环依赖，执行器会直接 FATAL 退出
+        // （它把 required=false 的输入也算作依赖边）。
+        // 需要对照记录这些量时，用独立的 ValueCollector 组件按名字订阅即可
+        // —— 它只读不写，不参与依赖环。
 
         csv_file_.open(csv_path_, std::ios::out | std::ios::trunc);
         if (!csv_file_.is_open())
@@ -125,7 +130,6 @@ public:
         csv_file_ << "update_count,elapsed_s,velocity_reference,"
                   << "/gimbal/yaw/velocity_imu,"
                   << "/gimbal/yaw/velocity,"
-                  << "/gimbal/yaw/control_torque,"
                   << "/gimbal/yaw/torque,"
                   << "/gimbal/yaw/angle,"
                   << "/gimbal/yaw/temperature,"
@@ -305,7 +309,6 @@ private:
         csv_file_ << sample_index_++ << "," << elapsed << "," << reference << ","
                   << value_or_nan(measured_velocity_imu_) << ","
                   << value_or_nan(measured_velocity_) << ","
-                  << value_or_nan(ctrl_control_torque_) << ","
                   << value_or_nan(measured_torque_) << ","
                   << value_or_nan(measured_angle_) << ","
                   << value_or_nan(measured_temperature_) << ","
@@ -366,7 +369,6 @@ private:
     rmcs_executor::Component::InputInterface<double> measured_angle_;
     rmcs_executor::Component::InputInterface<double> measured_temperature_;
     rmcs_executor::Component::InputInterface<double> measured_max_torque_;
-    rmcs_executor::Component::InputInterface<double> ctrl_control_torque_;
 
     std::ofstream csv_file_;
 };

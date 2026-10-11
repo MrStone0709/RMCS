@@ -63,11 +63,7 @@ public:
     StepResponseController()
         : Node(
               get_component_name(),
-              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {}
-
-    auto before_pairing(const OutputInfoMap& output_map) -> void override {
-        (void)output_map; // 本组件不依赖其它组件输出，只看参数
-
+              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {
         // ---- 目标轴 ----------------------------------------------------------
         std::string axis;
         get_parameter_or("axis", axis, std::string{"yaw"});
@@ -115,7 +111,12 @@ public:
         if (!(angle_limit_ > 0.0))
             throw std::runtime_error("angle_limit must be > 0");
 
-        // ---- 接口注册（必须在 before_pairing 里）----------------------------
+        // ---- 接口注册 -------------------------------------------------------
+        // 【关键】必须在本构造函数体里注册，不能放到 before_pairing。
+        // 执行器 init() 先遍历所有组件建立 output_map，然后才调用 before_pairing，
+        // 最后才绑定输入。在 before_pairing 里 register_output 的输出不会进入
+        // output_map，消费方会静默绑定失败。（详见 velocity_reference_injector.cpp）
+        //
         // 输出：目标角。写非 nan 即让电机进入角度模式。
         register_output(prefix_ + "/control_angle", control_angle_, kNaN);
 
@@ -127,9 +128,12 @@ public:
         register_input(prefix_ + "/max_torque", measured_max_torque_, false);
         register_input(prefix_ + "/velocity_imu", measured_velocity_imu_, false);
 
-        // 云台控制器该轴的输出（角度模式下电机不采信，仅作对比记录）。
-        register_input(prefix_ + "/control_torque", ctrl_control_torque_, false);
-        register_input(prefix_ + "/control_angle_error", ctrl_angle_error_, false);
+        // 注意：这里【不能】读云台控制器该轴的输出
+        // （/gimbal/<axis>/control_torque、control_angle_error）。
+        // 本组件写 /gimbal/<axis>/control_angle，云台控制器读它；若本组件再反过来
+        // 读云台控制器的输出，就构成循环依赖，执行器会 FATAL 退出
+        // （required=false 的输入同样算依赖边）。
+        // 需要对照时用独立 ValueCollector 按名字订阅。
 
         // 触发用遥控器开关
         register_input("/remote/switch/left", switch_left_, false);
@@ -150,9 +154,7 @@ public:
                   << prefix_ << "/velocity_imu,"
                   << prefix_ << "/torque,"
                   << prefix_ << "/temperature,"
-                  << prefix_ << "/max_torque,"
-                  << prefix_ << "/control_torque,"
-                  << prefix_ << "/control_angle_error\n";
+                  << prefix_ << "/max_torque\n";
 
         RCLCPP_INFO(
             get_logger(), "step response on %s: %.4f -> %.4f rad, hold %.2f s before / %.2f s after, csv=%s",
@@ -350,9 +352,7 @@ private:
                   << value_or_nan(measured_velocity_imu_) << ","
                   << value_or_nan(measured_torque_) << ","
                   << value_or_nan(measured_temperature_) << ","
-                  << value_or_nan(measured_max_torque_) << ","
-                  << value_or_nan(ctrl_control_torque_) << ","
-                  << value_or_nan(ctrl_angle_error_) << "\n";
+                  << value_or_nan(measured_max_torque_) << "\n";
 
         if (++flush_tick_ >= 100) {
             flush_tick_ = 0;
@@ -412,8 +412,6 @@ private:
     rmcs_executor::Component::InputInterface<double> measured_temperature_;
     rmcs_executor::Component::InputInterface<double> measured_max_torque_;
     rmcs_executor::Component::InputInterface<double> measured_velocity_imu_;
-    rmcs_executor::Component::InputInterface<double> ctrl_control_torque_;
-    rmcs_executor::Component::InputInterface<double> ctrl_angle_error_;
 
     rmcs_executor::Component::InputInterface<rmcs_msgs::Switch> switch_left_;
     rmcs_executor::Component::InputInterface<rmcs_msgs::Switch> switch_right_;

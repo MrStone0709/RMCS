@@ -59,22 +59,6 @@ public:
         //   true  -> 若 /gimbal/yaw/control_velocity 有发布者且数值有限，
         //            则直接把它当速度参考；否则回退到角度环输出，不会失控。
         get_parameter_or("yaw_velocity_command_input", yaw_velocity_command_input_, false);
-        RCLCPP_INFO(
-            get_logger(), "[DIAG-REG-IN] active=%d ready=%d",
-            static_cast<int>(input_.yaw_velocity_command.active()),
-            static_cast<int>(input_.yaw_velocity_command.ready()));
-
-        // 临时诊断：打印 yaw 速度环的真实限幅与增益。
-        // 背景：配置里没有 yaw_velocity_output_min/max，而 configure_pid 用的是
-        // 不带默认值的 get_parameter。需要确认这里到底取到了什么值。
-        RCLCPP_INFO(
-            get_logger(),
-            "[DIAG] yaw_velocity kp=%.4f ki=%.4f out=[%.6f,%.6f] int=[%.6f,%.6f] "
-            "split=[%.6f,%.6f] yaw_vel_cmd_input=%d",
-            yaw_velocity_pid_.kp, yaw_velocity_pid_.ki, yaw_velocity_pid_.output_min,
-            yaw_velocity_pid_.output_max, yaw_velocity_pid_.integral_min,
-            yaw_velocity_pid_.integral_max, yaw_velocity_pid_.integral_split_min,
-            yaw_velocity_pid_.integral_split_max, static_cast<int>(yaw_velocity_command_input_));
     }
 
 
@@ -83,18 +67,17 @@ public:
     auto before_pairing(const OutputInfoMap& output_map) -> void override {
         (void)output_map;
         input_.register_velocity_command_input(*this);
-        RCLCPP_INFO(
-            get_logger(), "[DIAG-REG-IN-BP] active=%d ready=%d",
-            static_cast<int>(input_.yaw_velocity_command.active()),
-            static_cast<int>(input_.yaw_velocity_command.ready()));
     }
 
     auto update() -> void override {
-        if (!pairing_checked_) {
-            pairing_checked_ = true;
+        // 首拍打印一次注入通道的绑定状态，便于现场确认"速度参考注入"是否真正接通。
+        // （绑定发生在 before_pairing 之后，因此只能在 update 里判断。）
+        if (!velocity_command_reported_) {
+            velocity_command_reported_ = true;
             RCLCPP_INFO(
-                get_logger(), "[DIAG-PAIR] after pairing: active=%d ready=%d",
-                static_cast<int>(input_.yaw_velocity_command.active()),
+                get_logger(),
+                "yaw velocity-reference injection: enabled=%d bound=%d",
+                static_cast<int>(yaw_velocity_command_input_),
                 static_cast<int>(input_.yaw_velocity_command.ready()));
         }
         const auto switch_right = *input_.switch_right;
@@ -150,12 +133,6 @@ public:
             const bool vc_finite = vc_ready && std::isfinite(*input_.yaw_velocity_command);
             const bool inject = yaw_velocity_command_input_ && vc_ready && vc_finite;
             // 临时诊断：三个条件分别是什么
-            RCLCPP_INFO_THROTTLE(
-                get_logger(), *get_clock(), 500,
-                "[DIAG-COND] flag=%d ready=%d finite=%d inject=%d raw=%.4f",
-                static_cast<int>(yaw_velocity_command_input_), static_cast<int>(vc_ready),
-                static_cast<int>(vc_finite), static_cast<int>(inject),
-                vc_ready ? *input_.yaw_velocity_command : -999.0);
 
             if (!std::isfinite(angle_error.yaw_angle_error)) {
                 yaw_angle_pid_.reset();
@@ -167,13 +144,6 @@ public:
                 // 一旦切回非注入模式就会把残余积分量猛地加到速度参考上。
                 yaw_angle_pid_.reset();
                 const auto yaw_velocity_ref = *input_.yaw_velocity_command;
-                // 临时诊断：确认注入分支真的在跑、以及误差的量级
-                RCLCPP_INFO_THROTTLE(
-                    get_logger(), *get_clock(), 500,
-                    "[DIAG-INJ] ref=%.4f v_imu=%.5f err=%.4f ctl=%.4f",
-                    yaw_velocity_ref, *input_.yaw_velocity_imu,
-                    yaw_velocity_ref - *input_.yaw_velocity_imu,
-                    yaw_velocity_pid_.kp * (yaw_velocity_ref - *input_.yaw_velocity_imu));
                 *output_.yaw_control_torque =
                     yaw_velocity_pid_.update(yaw_velocity_ref - *input_.yaw_velocity_imu)
                     + trajectory_ff.yaw_velocity + trajectory_ff.yaw_acceleration;
@@ -530,7 +500,7 @@ private:
     /// true 时若 /gimbal/yaw/control_velocity 有有限值，则直接用它作为速度参考，
     /// 用于在不改动速度环的前提下做阶跃/扫频辨识。详见构造函数注释。
     bool yaw_velocity_command_input_ = false;
-    bool pairing_checked_ = false;
+    bool velocity_command_reported_ = false;
 
     bool pitch_lock_active_ = false;
     bool suspension_on_by_switch_ = false;
