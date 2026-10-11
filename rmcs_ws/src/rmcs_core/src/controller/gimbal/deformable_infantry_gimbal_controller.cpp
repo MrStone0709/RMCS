@@ -59,6 +59,11 @@ public:
         //   true  -> 若 /gimbal/yaw/control_velocity 有发布者且数值有限，
         //            则直接把它当速度参考；否则回退到角度环输出，不会失控。
         get_parameter_or("yaw_velocity_command_input", yaw_velocity_command_input_, false);
+
+        // 角度环辨识开关（默认 false = 生产行为完全不变）。
+        // true 时若 /gimbal/yaw/angle_command 有有限值，则把它作为**目标角偏移**
+        // 加到求解器给出的角误差上，等效于阶跃目标角，从而激励角度环本身。
+        get_parameter_or("yaw_angle_command_input", yaw_angle_command_input_, false);
     }
 
 
@@ -67,6 +72,7 @@ public:
     auto before_pairing(const OutputInfoMap& output_map) -> void override {
         (void)output_map;
         input_.register_velocity_command_input(*this);
+        input_.register_angle_command_input(*this);
     }
 
     auto update() -> void override {
@@ -76,9 +82,11 @@ public:
             velocity_command_reported_ = true;
             RCLCPP_INFO(
                 get_logger(),
-                "yaw velocity-reference injection: enabled=%d bound=%d",
+                "yaw injection: velocity_ref enabled=%d bound=%d | angle_offset enabled=%d bound=%d",
                 static_cast<int>(yaw_velocity_command_input_),
-                static_cast<int>(input_.yaw_velocity_command.ready()));
+                static_cast<int>(input_.yaw_velocity_command.ready()),
+                static_cast<int>(yaw_angle_command_input_),
+                static_cast<int>(input_.yaw_angle_command.ready()));
         }
         const auto switch_right = *input_.switch_right;
         const auto switch_left = *input_.switch_left;
@@ -132,7 +140,6 @@ public:
             const bool vc_ready = input_.yaw_velocity_command.ready();
             const bool vc_finite = vc_ready && std::isfinite(*input_.yaw_velocity_command);
             const bool inject = yaw_velocity_command_input_ && vc_ready && vc_finite;
-            // 临时诊断：三个条件分别是什么
 
             if (!std::isfinite(angle_error.yaw_angle_error)) {
                 yaw_angle_pid_.reset();
@@ -230,8 +237,16 @@ private:
             component.register_input("/gimbal/yaw/velocity_command", yaw_velocity_command, false);
         }
 
+        /// 注册 yaw 角度偏移注入输入（角度环辨识用）。同样必须在构造函数体里调用。
+        void register_angle_command_input(rmcs_executor::Component& component) {
+            component.register_input("/gimbal/yaw/angle_command", yaw_angle_command, false);
+        }
+
         /// yaw 速度参考注入接口，由外部注入组件写入。
         InputInterface<double> yaw_velocity_command;
+        /// yaw 角度偏移注入接口（rad）。加到求解器给出的角误差上，
+        /// 等效于把目标角阶跃一个偏移量，见 update() 中的说明。
+        InputInterface<double> yaw_angle_command;
 
         InputInterface<Eigen::Vector2d> joystick_left;
         InputInterface<rmcs_msgs::Keyboard> keyboard;
@@ -303,7 +318,31 @@ private:
 
     auto manual_yaw_shift() const -> double {
         return joystick_sensitivity_ * input_.joystick_left->y()
-             + mouse_sensitivity_ * input_.mouse_velocity->y();
+             + mouse_sensitivity_ * input_.mouse_velocity->y() + injected_yaw_shift();
+    }
+
+    /// 角度环辨识用的 yaw 速率指令注入（单位 rad/s）。
+    ///
+    /// 为什么要注入 yaw_shift 而不是角误差：
+    ///   求解器 TwoAxisGimbalSolver 是**速率式**的 —— SetControlShift 把当前控制
+    ///   方向每拍旋转 yaw_shift_（见 two_axis_gimbal_solver.hpp:76-98），
+    ///   即**目标角以 yaw_shift 的速率累积（斜坡）**，空闲时 yaw_shift=0 目标角冻结。
+    ///   这是生产环境唯一存在的指令形式（摇杆/鼠标都走这条路）。
+    ///
+    ///   曾经尝试过"给角误差叠加偏移"来等效阶跃目标角 —— 那是错的：
+    ///   求解器的误差是根据实际角度实时算的，云台一动误差就减小，最终
+    ///   solver_err ≈ -offset、净误差≈0，只在极慢速率下改变平衡点，
+    ///   几乎不产生可观测的响应（实测 solver_err=-0.2500 vs offs=+0.2500）。
+    ///
+    ///   恒定 yaw_shift = c  <->  目标角以 c 匀速旋转  <->  速度环的**速度阶跃**，
+    ///   正是角度环在生产中要跟踪的工况。
+    ///
+    /// 三重回退：开关关闭 / 无人发布 / 值为 nan 时返回 0，行为与改动前逐字相同。
+    auto injected_yaw_shift() const -> double {
+        if (!yaw_angle_command_input_ || !input_.yaw_angle_command.ready()
+            || !std::isfinite(*input_.yaw_angle_command))
+            return 0.0;
+        return *input_.yaw_angle_command;
     }
 
     auto auto_aim_requested() const -> bool {
@@ -501,6 +540,9 @@ private:
     /// 用于在不改动速度环的前提下做阶跃/扫频辨识。详见构造函数注释。
     bool yaw_velocity_command_input_ = false;
     bool velocity_command_reported_ = false;
+
+    /// yaw 角度偏移注入开关。默认 false：角度环输入完全来自求解器，生产行为不变。
+    bool yaw_angle_command_input_ = false;
 
     bool pitch_lock_active_ = false;
     bool suspension_on_by_switch_ = false;
