@@ -98,16 +98,28 @@ launcher_hardware:
     # 右拨杆 MIDDLE 时的限速比例（精细微调模式）
     slow_speed_scale: 0.35
 
-    # ---- 自动找最高点（上电自检：持续上升 -> 持续堵转 -> 记为上限）----
+    # ---- 自动找最高点（上电自检：持续上升 -> 某侧到顶就停该侧 -> 两侧都到顶记为上限）----
     homing_enabled: true
     # 上升速度（电机轴 rad/s，40 约等于 380 rpm 输出）
     homing_rise_velocity: 10.0
-    # 堵转判据：|速度| 低于此值 且 |力矩| 高于下值（两台 pitch 电机都要满足）
-    homing_stall_velocity: 2.0
+    # 到顶判据 1（速度判据，**按侧独立判定**）：|速度| 低于此值 且 |力矩| 高于下值
+    # 注意：两侧不会同时到顶（装配/导程/摩擦差），所以判定与停机都是单侧独立的；
+    # 先到顶的那一侧会立刻停该侧给定，不再顶着机械限位继续出力。
+    homing_stall_velocity: 7.0
     homing_stall_torque: 0.4
     # 连续满足多少个周期才确认（update_rate=1000 时 100 = 0.1 s；改 update_rate 要同步改这里）
     homing_stall_confirm_ticks: 100
-    # 超时未找到最高点 -> 停转并把上限退回下面的 pitch_max_rad 兜底值（20000 = 20 s）
+    # 到顶判据 2（进度判据，同样按侧独立）：在下面这个窗口内，该侧电机轴角度增量小于
+    # homing_min_progress_rad 且仍在出力 -> 判该侧到顶。
+    # 兜住"速度反馈抖动导致速度判据反复清零"以及"指令在推但轴就是不动"的情况；
+    # 置 homing_progress_window_ticks: 0 可关闭该判据。
+    homing_progress_window_ticks: 500
+    homing_min_progress_rad: 0.2
+    # 单侧到顶后，另一侧最多再找这么多周期（3000 = 3 s）就整体判失败并停转。
+    # 用于兜住"一侧到顶、另一侧丝杆打滑/联轴器松动/两侧反向"这类机械异常；
+    # 3 s 对应 homing_rise_velocity=10、导程 2mm 时约 9.5 mm 的额外行程。
+    homing_single_side_timeout_ticks: 3000
+    # 整体超时未找到最高点 -> 停转并把上限退回下面的 pitch_max_rad 兜底值（40000 = 40 s）
     homing_timeout_ticks: 40000
     # 是否要求遥控在线且拨杆不在"双 DOWN 失能"位才允许自动上升（台架调试可置 false）
     homing_require_remote: true

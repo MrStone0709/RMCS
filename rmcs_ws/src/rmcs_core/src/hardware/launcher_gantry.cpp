@@ -153,9 +153,18 @@ public:
         // ---- 5. 自动找最高点 ----
         homing_enabled_ = get_param_or(*this, "homing_enabled", true);
         homing_rise_velocity_ = get_param_or(*this, "homing_rise_velocity", 40.0);
-        homing_stall_velocity_ = get_param_or(*this, "homing_stall_velocity", 2.0);
+        homing_stall_velocity_ = get_param_or(*this, "homing_stall_velocity", 7.0);
         homing_stall_torque_ = get_param_or(*this, "homing_stall_torque", 0.4);
         homing_stall_confirm_ticks_ = get_param_or(*this, "homing_stall_confirm_ticks", 100);
+        // 按侧独立的"推不动"进度判据：窗口内电机轴角度增量小于 homing_min_progress_rad
+        // 且该侧仍在出力 → 判定该侧到顶（兜住速度反馈抖动导致速度判据反复清零的情况）
+        homing_progress_window_ticks_ = get_param_or(*this, "homing_progress_window_ticks", 500);
+        homing_min_progress_rad_ = get_param_or(*this, "homing_min_progress_rad", 0.2);
+        // 单侧到顶后，另一侧最多再找这么多周期；超过就判失败并停转（防一侧顶着/一侧打滑）。
+        // 3000 = 3 s（1 kHz）：homing_rise_velocity=10、导程 2mm 时约 9.5 mm 额外行程，
+        // 够吃掉正常的装配歪斜，又不至于让横梁持续扭转。
+        homing_single_side_timeout_ticks_ =
+            get_param_or(*this, "homing_single_side_timeout_ticks", 3000);
         homing_timeout_ticks_ = get_param_or(*this, "homing_timeout_ticks", 20000);
         homing_require_remote_ = get_param_or(*this, "homing_require_remote", true);
         homing_backoff_ticks_ = get_param_or(*this, "homing_backoff_ticks", 0);
@@ -365,11 +374,21 @@ public:
         const bool motion_allowed = (mode == Mode::kFull || mode == Mode::kSlow);
         const bool homing_allowed =
             homing_require_remote_ ? motion_allowed : hardware_ok;
+        // homing 输出的是**两侧各自**的给定：某一侧判定到顶后只停那一侧，
+        // 另一侧继续上升到它自己的顶点（顺带把两侧对齐）。
         double pitch_velocity_motor = 0.0;
+        double pitch_left_velocity_motor = 0.0;
+        double pitch_right_velocity_motor = 0.0;
         const bool homing_takes_over = update_homing(
-            homing_allowed, mode == Mode::kFault, pitch_angle, pitch_left_motor_.velocity(),
-            pitch_right_motor_.velocity(), pitch_left_motor_.torque(),
-            pitch_right_motor_.torque(), pitch_velocity_motor);
+            homing_allowed, mode == Mode::kFault,
+            {.left_angle = pitch_left_motor_.angle(),
+             .right_angle = pitch_right_motor_.angle(),
+             .left_velocity = pitch_left_motor_.velocity(),
+             .right_velocity = pitch_right_motor_.velocity(),
+             .left_torque = pitch_left_motor_.torque(),
+             .right_torque = pitch_right_motor_.torque(),
+             .pitch_angle = pitch_angle},
+            pitch_left_velocity_motor, pitch_right_velocity_motor);
         *homing_state_output_ = static_cast<double>(static_cast<int>(homing_state_));
         *pitch_upper_limit_output_ = pitch_upper_limit_rad_;
 
@@ -385,28 +404,38 @@ public:
         const double speed_scale = (mode == Mode::kSlow) ? slow_speed_scale_ : 1.0;
 
         double yaw_velocity_motor = max_yaw_velocity_motor_ * speed_scale * yaw_stick;
-        if (!homing_takes_over)
+
+        // ---- 未由 homing 接管时，两侧共用同一个摇杆给定 ----
+        if (!homing_takes_over) {
             pitch_velocity_motor = max_pitch_velocity_motor_ * speed_scale * pitch_stick;
 
-        // ---- 俯仰上限软限位：自动找最高点成功后用自动值，否则用 yaml 兜底值 ----
-        // @note 找最高点过程中不施加该限位（正在往上找），由 update_homing 接管。
-        if (!homing_takes_over && pitch_velocity_motor > 0.0
-            && pitch_angle >= pitch_upper_limit_rad_) {
-            RCLCPP_WARN_THROTTLE(
-                logger_, *get_clock(), 1000,
-                "[launcher] 俯仰已达上限 %.4f rad（当前 %.4f），不再上升", pitch_upper_limit_rad_,
-                pitch_angle);
-            pitch_velocity_motor = 0.0;
+            // 俯仰上限软限位：自动找最高点成功后用自动值，否则用 yaml 兜底值
+            // @note 找最高点过程中不施加该限位（正在往上找），由 update_homing 接管。
+            if (pitch_velocity_motor > 0.0 && pitch_angle >= pitch_upper_limit_rad_) {
+                RCLCPP_WARN_THROTTLE(
+                    logger_, *get_clock(), 1000,
+                    "[launcher] 俯仰已达上限 %.4f rad（当前 %.4f），不再上升",
+                    pitch_upper_limit_rad_, pitch_angle);
+                pitch_velocity_motor = 0.0;
+            }
+            // 还没找到最高点时的额外保护：向上的速度按 unhomed_up_speed_scale 限速
+            // 目的是把"任何原因导致俯仰被持续往上推"的后果限制成慢速爬升，而不是满速冲顶。
+            if (!pitch_upper_limit_valid_ && pitch_velocity_motor > 0.0) {
+                RCLCPP_WARN_THROTTLE(
+                    logger_, *get_clock(), 2000,
+                    "[launcher] 尚未找到最高点（homing_state=%s），俯仰上升限速到 %.0f%%",
+                    homing_state_name(homing_state_), unhomed_up_speed_scale_ * 100.0);
+                pitch_velocity_motor *= unhomed_up_speed_scale_;
+            }
+            pitch_left_velocity_motor = pitch_velocity_motor;
+            pitch_right_velocity_motor = pitch_velocity_motor;
+        } else {
+            // homing 接管：pitch_left/right_velocity_motor 已由 update_homing 按侧给出，
+            // 公共值只用于观测。
+            pitch_velocity_motor =
+                0.5 * (pitch_left_velocity_motor + pitch_right_velocity_motor);
         }
-        // ---- 还没找到最高点时的额外保护：向上的速度按 unhomed_up_speed_scale 限速 ----
-        // 目的是把"任何原因导致俯仰被持续往上推"的后果限制成慢速爬升，而不是满速冲顶。
-        if (!homing_takes_over && !pitch_upper_limit_valid_ && pitch_velocity_motor > 0.0) {
-            RCLCPP_WARN_THROTTLE(
-                logger_, *get_clock(), 2000,
-                "[launcher] 尚未找到最高点（homing_state=%s），俯仰上升限速到 %.0f%%",
-                homing_state_name(homing_state_), unhomed_up_speed_scale_ * 100.0);
-            pitch_velocity_motor *= unhomed_up_speed_scale_;
-        }
+
         // ---- 偏航软限位（默认关闭；开启后撞限位只禁止继续朝外）----
         if (yaw_limit_enabled_) {
             if ((yaw_angle >= yaw_max_rad_ && yaw_velocity_motor > 0.0)
@@ -418,18 +447,14 @@ public:
             }
         }
 
-        // ---- 公共给定（观测用；yaml 里的两个 pitch PID 用的是下面按侧修正过的名字）----
-        *pitch_control_velocity_ = pitch_velocity_motor;
-        *yaw_control_velocity_ = yaw_velocity_motor;
-
         // ---- 底部限位：**单侧**归零。一侧压到底先停，另一侧继续走，
         //      因此"两侧一起往下压到底"就是把累积歪斜重新对齐的操作。----
-        double pitch_left_velocity_motor = pitch_velocity_motor;
-        double pitch_right_velocity_motor = pitch_velocity_motor;
+        *yaw_control_velocity_ = yaw_velocity_motor;
         if (left_limit_active && pitch_left_velocity_motor < 0.0)
             pitch_left_velocity_motor = 0.0;
         if (right_limit_active && pitch_right_velocity_motor < 0.0)
             pitch_right_velocity_motor = 0.0;
+        *pitch_control_velocity_ = pitch_velocity_motor;
         *pitch_left_control_velocity_ = pitch_left_velocity_motor;
         *pitch_right_control_velocity_ = pitch_right_velocity_motor;
 
@@ -535,7 +560,7 @@ private:
     void check_gpio_index(int index, const std::string& name) const {
         if (index < -1 || index > 6)
             throw std::runtime_error(
-                "[launcher] " + name + " 必须在 0..6（C 板 PWM1..PWM7）或 -1（不启用）");
+                "[launcher] " + name + " 必须在 0..6(C 板 PWM1..PWM7)或 -1(不启用)");
     }
 
     /// 电机输出轴角 → 机构角。
@@ -573,29 +598,87 @@ private:
         }
     }
 
-    /// @brief 自动找最高点状态机：上电后持续上升 → 持续堵转即认定到顶。
+    /// @brief 单侧的"到顶/推不动"判定状态（两侧各一份）。
     ///
-    /// 堵转判据（两台 pitch 电机都要满足）：|速度| < homing_stall_velocity 且 |力矩| >
-    /// homing_stall_torque，连续 homing_stall_confirm_ticks 个周期；与
-    /// controller/chassis/climber/stick_group.hpp 的 blocked 判据同一思路。
+    /// @note 为什么必须**按侧独立**判定：两台 pitch 电机驱动的是同一个刚性横梁，
+    ///       两侧不可能同时到顶（装配误差/导程差/摩擦差都会让一侧先到）。
+    ///       早先的版本要求"两台同时堵转"才做任何处理，结果先到顶的那一侧
+    ///       会被速度环一直以满力矩顶着机械限位，直到 homing 超时——这就是
+    ///       "id=2 到限位后仍然持续旋转（持续出力）"的直接原因。
+    struct SideStallState {
+        double window_start_angle = 0.0; ///< 进度判据的窗口起点（电机输出轴 rad）
+        int window_ticks = 0;            ///< 进度窗口已经过的周期数
+        int stall_ticks = 0;             ///< 连续满足速度判据的周期数
+        bool latched = false;            ///< 已确认到顶（锁存，本轮到顶期间不再解除）
+    };
+
+    /// @brief 单侧到顶判定。两个判据满足任一（且在该侧确实有力矩输出）即锁存：
+    ///   1. **速度判据**：|v| < homing_stall_velocity 且 |τ| > homing_stall_torque，
+    ///      连续 homing_stall_confirm_ticks 个周期（与 stick_group.hpp 的 blocked 判据同思路）；
+    ///   2. **进度判据**：在 homing_progress_window_ticks 窗口内，电机轴角度增量小于
+    ///      homing_min_progress_rad 且 |τ| > homing_stall_torque。
+    ///      这条兜住"速度反馈抖动导致速度判据反复清零"以及"指令在推但轴就是不动"的情况。
+    auto update_side_stall(
+        SideStallState& state, double angle, double velocity, double torque) -> bool {
+        if (state.latched)
+            return true;
+
+        const bool pushing = std::abs(torque) > homing_stall_torque_;
+
+        // 判据 1：速度（homing_stall_confirm_ticks <= 0 表示关闭该判据）
+        if (homing_stall_confirm_ticks_ > 0) {
+            if (pushing && std::abs(velocity) < homing_stall_velocity_)
+                ++state.stall_ticks;
+            else
+                state.stall_ticks = 0;
+            if (state.stall_ticks >= homing_stall_confirm_ticks_) {
+                state.latched = true;
+                return true;
+            }
+        }
+
+        // 判据 2：进度（窗口 <= 0 表示关闭该判据）
+        if (homing_progress_window_ticks_ > 0) {
+            if (state.window_ticks == 0)
+                state.window_start_angle = angle;
+            if (++state.window_ticks >= homing_progress_window_ticks_) {
+                const double progress = std::abs(angle - state.window_start_angle);
+                state.window_ticks = 0;
+                if (pushing && progress < homing_min_progress_rad_)
+                    state.latched = true;
+            }
+        }
+        return state.latched;
+    }
+
+    /// @brief 自动找最高点状态机：上电后持续上升 → 每侧各自到顶 → 记为上限。
     ///
-    /// 三条额外的安全规则（针对"长时间待机后机构突然满速上升"的事故）：
+    /// 关键点（v2，修掉了"先到顶的一侧被一直顶着"的缺陷）：
+    /// - **按侧独立判定、按侧独立停**：某一侧确认到顶就把**那一侧**的给定清零（速度环立刻
+    ///   不再出力），另一侧继续上升到它自己的顶点 → 顺带把两侧机械对齐；
+    /// - 两侧都到顶 → 记录当前俯仰角（两侧平均值）为上限软限位；
+    /// - 只有单侧到顶而另一侧长时间不动 → 判失败并停转（可能丝杆打滑/联轴器松动/两侧反向）。
+    ///
+    /// 另外三条安全规则（针对"长时间待机后机构突然满速上升"、"通信断了命令发不出去"）：
     /// 1. **启动窗口**：进程启动 homing_start_window_ticks 之内才允许自动开始上升；
-    ///    超过窗口必须用 `/gimbal/home` 显式触发。避免"待机时遥控关着（状态一直停在
-    ///    IDLE）→ 回来一开遥控 → 机构立刻自己冲上去"。
-    /// 2. **故障即失败**：上升期间出现硬件故障（CAN 反馈超时/过温）直接判失败并停转，
-    ///    不再"等条件恢复后接着往上冲"；短暂失能（拨杆/遥控）中断超过
-    ///    homing_interrupt_abort_ticks 也同样判失败。
+    ///    超过窗口必须用 `/gimbal/home` 显式触发。
+    /// 2. **故障即失败**：上升期间出现硬件故障（CAN 反馈超时/过温）直接判失败并停转；
+    ///    被拨杆/遥控中断超过 homing_interrupt_abort_ticks 也同样判失败。
     /// 3. 失败/未完成时上限退回 yaml 兜底值，并且调用方会对"向上"指令额外限速。
     ///
-    /// @param permitted 本周期是否允许运动（模式为 FULL/SLOW，或台架模式下硬件正常）
-    /// @param faulted 本周期是否处于硬件故障
-    /// @param pitch_command 输出：本周期俯仰速度给定（电机轴 rad/s）
+    /// @param inputs 两侧角度/速度/力矩与俯仰角（均值）
+    /// @param command_left/command_right 输出：两侧各自的俯仰速度给定（电机轴 rad/s）
     /// @return true 表示本周期俯仰由 homing 接管（调用方忽略俯仰摇杆与上限软限位）
+    struct HomingInputs {
+        double left_angle, right_angle;
+        double left_velocity, right_velocity;
+        double left_torque, right_torque;
+        double pitch_angle;
+    };
+
     auto update_homing(
-        bool permitted, bool faulted, double pitch_angle, double left_velocity,
-        double right_velocity, double left_torque, double right_torque, double& pitch_command)
-        -> bool {
+        bool permitted, bool faulted, const HomingInputs& inputs, double& command_left,
+        double& command_right) -> bool {
 
         if (!homing_enabled_ || homing_state_ == HomingState::kDone
             || homing_state_ == HomingState::kFailed)
@@ -619,27 +702,34 @@ private:
             if (!permitted)
                 return true; // 条件不满足：接管但不动（避免一满足条件就被摇杆抢走）
             homing_state_ = HomingState::kRising;
-            stall_ticks_ = 0;
+            left_side_ = SideStallState{};
+            right_side_ = SideStallState{};
             homing_ticks_ = 0;
             interrupt_ticks_ = 0;
+            single_side_ticks_ = 0;
             RCLCPP_INFO(
                 logger_,
-                "[launcher] 自动找最高点开始：以 %.1f rad/s(电机轴) 持续上升，堵转 %.1f rad/s / "
-                "%.2f N·m 持续 %d 周期即认定到顶",
+                "[launcher] 自动找最高点开始：两侧各以 %.1f rad/s(电机轴) 上升；某侧 |v|<%.1f 且 "
+                "|τ|>%.2f 持续 %d 周期（或 %.2f s 内角度增量 < %.2f rad）即认定该侧到顶并停该侧",
                 homing_rise_velocity_, homing_stall_velocity_, homing_stall_torque_,
-                homing_stall_confirm_ticks_);
+                homing_stall_confirm_ticks_,
+                static_cast<double>(homing_progress_window_ticks_)
+                    / 1000.0, // NOLINT: 按 1 kHz 换算，仅用于日志说明
+                homing_min_progress_rad_);
         }
 
         if (faulted) {
             // 硬件故障：直接失败。这样即便随后通信恢复，也不会接着往上冲。
             abort_homing("出现硬件故障（CAN 反馈超时/过温）");
-            pitch_command = 0.0;
+            command_left = 0.0;
+            command_right = 0.0;
             return true;
         }
 
         if (!permitted) {
             // 短暂失能（拨杆/遥控离线）：先暂停；超过时限则判失败
-            pitch_command = 0.0;
+            command_left = 0.0;
+            command_right = 0.0;
             if (++interrupt_ticks_ >= homing_interrupt_abort_ticks_) {
                 abort_homing("上升过程中被中断超时（拨杆失能/遥控离线）");
             }
@@ -650,50 +740,66 @@ private:
         switch (homing_state_) {
         case HomingState::kRising: {
             ++homing_ticks_;
-            pitch_command = homing_rise_velocity_;
 
-            const bool left_stalled = std::abs(left_velocity) < homing_stall_velocity_
-                                   && std::abs(left_torque) > homing_stall_torque_;
-            const bool right_stalled = std::abs(right_velocity) < homing_stall_velocity_
-                                    && std::abs(right_torque) > homing_stall_torque_;
-            stall_ticks_ = (left_stalled && right_stalled) ? stall_ticks_ + 1 : 0;
+            const bool left_stalled = update_side_stall(
+                left_side_, inputs.left_angle, inputs.left_velocity, inputs.left_torque);
+            const bool right_stalled = update_side_stall(
+                right_side_, inputs.right_angle, inputs.right_velocity, inputs.right_torque);
 
-            if (stall_ticks_ >= homing_stall_confirm_ticks_) {
-                pitch_upper_limit_rad_ = pitch_angle;
+            // 已到顶的一侧给定清零：它的速度环会在下一周期把力矩收到 0，
+            // 不再"顶着机械限位继续出力"。
+            command_left = left_stalled ? 0.0 : homing_rise_velocity_;
+            command_right = right_stalled ? 0.0 : homing_rise_velocity_;
+
+            if (left_stalled != right_stalled)
+                ++single_side_ticks_;
+
+            // 每秒打一条两侧遥测，便于判断是"真堵转"还是"打滑/反向"
+            RCLCPP_INFO_THROTTLE(
+                logger_, *get_clock(), 1000,
+                "[launcher] 找顶中: L(id2) θ=%.2f v=%.2f τ=%.2f%s | R(id3) θ=%.2f v=%.2f τ=%.2f%s",
+                inputs.left_angle, inputs.left_velocity, inputs.left_torque,
+                left_stalled ? " [到顶]" : "", inputs.right_angle, inputs.right_velocity,
+                inputs.right_torque, right_stalled ? " [到顶]" : "");
+
+            if (left_stalled && right_stalled) {
+                pitch_upper_limit_rad_ = inputs.pitch_angle;
                 pitch_upper_limit_valid_ = true;
                 if (homing_backoff_ticks_ > 0) {
                     homing_state_ = HomingState::kBackoff;
                     backoff_ticks_ = 0;
                 } else {
                     homing_state_ = HomingState::kDone;
-                    pitch_command = 0.0;
                 }
+                command_left = 0.0;
+                command_right = 0.0;
                 RCLCPP_INFO(
                     logger_,
-                    "[launcher] 已找到最高点：俯仰角 %.4f rad（横梁高度 %.1f mm，对应两侧电机轴 "
-                    "%.4f rad），已设为俯仰上限软限位",
+                    "[launcher] 两侧均到顶：俯仰角 %.4f rad（横梁高度 %.1f mm），已设为俯仰上限"
+                    "软限位（两侧角度差 %.2f rad 电机轴）",
                     pitch_upper_limit_rad_,
                     pitch_upper_limit_rad_ / std::max(pitch_rad_per_meter_, 1e-9) * 1000.0,
-                    pitch_angle / std::max(pitch_rad_per_motor_turn_, 1e-9) * 2.0
-                        * std::numbers::pi);
+                    inputs.left_angle - inputs.right_angle);
+            } else if (single_side_ticks_ >= homing_single_side_timeout_ticks_) {
+                abort_homing(
+                    "只有单侧到顶，另一侧长时间未到顶（可能是丝杆打滑/联轴器松动/两侧运动反向，"
+                    "请看上面每秒打印的两侧 θ/v/τ）");
             } else if (homing_ticks_ >= homing_timeout_ticks_) {
-                homing_state_ = HomingState::kFailed;
-                pitch_command = 0.0;
-                RCLCPP_ERROR(
-                    logger_,
-                    "[launcher] 自动找最高点超时（%d 周期）：俯仰停转，上限退回 yaml 兜底值 "
-                    "%.4f rad。请检查丝杆是否卡死/电机是否上电/堵转阈值是否过严",
-                    homing_timeout_ticks_, pitch_max_rad_);
+                abort_homing("整体超时未找到最高点（请检查丝杆是否卡死/电机是否上电/堵转阈值）");
             }
             break;
         }
         case HomingState::kBackoff: {
             ++backoff_ticks_;
-            pitch_command = -std::abs(homing_backoff_velocity_);
+            command_left = -std::abs(homing_backoff_velocity_);
+            command_right = -std::abs(homing_backoff_velocity_);
             if (backoff_ticks_ >= homing_backoff_ticks_) {
                 homing_state_ = HomingState::kDone;
-                pitch_command = 0.0;
-                RCLCPP_INFO(logger_, "[launcher] 回退结束，上限软限位 %.4f rad 生效", pitch_upper_limit_rad_);
+                command_left = 0.0;
+                command_right = 0.0;
+                RCLCPP_INFO(
+                    logger_, "[launcher] 回退结束，上限软限位 %.4f rad 生效",
+                    pitch_upper_limit_rad_);
             }
             break;
         }
@@ -888,6 +994,9 @@ private:
     double homing_stall_velocity_ = 2.0;
     double homing_stall_torque_ = 0.4;
     int homing_stall_confirm_ticks_ = 100;
+    int homing_progress_window_ticks_ = 500;
+    double homing_min_progress_rad_ = 0.2;
+    int homing_single_side_timeout_ticks_ = 10000;
     int homing_timeout_ticks_ = 20000;
     bool homing_require_remote_ = true;
     int homing_backoff_ticks_ = 0;
@@ -927,11 +1036,12 @@ private:
 
     Mode last_mode_ = Mode::kFault;
     HomingState homing_state_ = HomingState::kIdle;
-    int stall_ticks_ = 0;
+    SideStallState left_side_, right_side_;
     int homing_ticks_ = 0;
     int backoff_ticks_ = 0;
     int homing_lifetime_ticks_ = 0;
     int interrupt_ticks_ = 0;
+    int single_side_ticks_ = 0;
     bool start_window_expired_logged_ = false;
     std::int64_t tx_failures_ = 0;
 };
