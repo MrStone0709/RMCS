@@ -2,8 +2,9 @@
 # 龙门发射架（方案 III）：三台 M2006+C610 全部挂在 C 板 CAN1 上（ID 1 / 2 / 3）
 #
 # 控制结构：
-#   摇杆映射 + 自动找最高点 + 限位 + 看门狗  ->  hardware::LauncherGantry
-#   三路速度环                              ->  controller::pid::PidController x3
+#   摇杆映射 + 自动找最高点 + 到顶归零 + 限位 + 看门狗  ->  hardware::LauncherGantry
+#   三路速度环                                        ->  controller::pid::PidController x3
+#   两台 pitch 的差反馈（交叉耦合同步环）              ->  controller::pid::PidController x1
 #   没有角度环：松手 = 速度给 0（靠丝杆自锁保位），所以不需要 /tf、不需要 IMU。
 #
 # 速度给定与速度反馈**都是电机输出轴 rad/s**（M2006 空载约 500 rpm ≈ 52 rad/s），
@@ -13,19 +14,30 @@
 #   同时 +/-0.5 rad 的偏航软限位在电机轴只相当于 0.08 圈，几乎立刻把给定清零。两处都已修掉。）
 #
 # 自动找最高点（上电自检）：
-#   使能后俯仰轴以 homing_rise_velocity 持续上升，两台 pitch 电机收到同一个速度给定
-#   -> 同步上升；当两台电机**同时持续堵转**（推得动但不动）时判定到顶，俯仰停转，
-#   把此时的俯仰角记为**上限软限位**，之后摇杆无法再把俯仰推过该角度。
+#   使能后俯仰轴以 homing_rise_velocity 持续上升，两侧**各自**判定到顶（速度+力矩判据、
+#   进度判据），先到顶的那一侧立刻停该侧给定，另一侧继续到自己的顶点；
+#   两侧都到顶后把该点记为**上限软限位**，之后摇杆无法再把俯仰推过该角度。
 #   下限软限位本版取消（下行保护依赖底部限位开关，若已接）。
 #   进度看 /gimbal/homing_state：0=待机 1=上升中 2=回退中 3=已完成 4=超时失败 5=已关闭。
 #
-# 同步前进怎么保证：
+# 到顶归零（homing_zero_on_top）：
+#   两侧都到顶时，硬件会调用 DjiMotor::calibrate_zero_point() 把两台 pitch 在那个点归零，
+#   即"两侧各自压住自己的机械顶点"= 两台电机 angle 的**共同机械零点**。
+#   这一步是下面差反馈能用的前提：编码器是相对式的，若不在同一个机械状态归零，
+#   两台电机的 angle 零点会相差"上电时的随机相位"（最大 ±0.09 rad ≈ 2mm 导程下 0.06 mm），
+#   差反馈与 skew_m 的物理含义就会带一个每次上电都不同的偏置。
+#   归零后坐标系：机械顶点 = pitch_zero_rad_；pitch_max_rad 会被自动改写成同一个值。
+#
+# 同步前进怎么保证（三层 + 一层可选的主动闭环）：
 #   1) 两台 pitch 电机的 setpoint 由硬件组件在同一个 tick 用同一个摇杆值算出，正常时数值相同；
 #   2) 两侧速度环 kp/ki/kd 必须逐字相同（下面两段是复制关系，改一边就改另一边）；
-#   3) 唯一会让两路给定不同的是"单侧底部限位触发"，这是故意的：一侧压到底就停，
-#      另一侧继续 -> "两侧一起往下压到底" 就是重新对齐、消除累积歪斜的操作。
-#   注意：本方案没有"两侧高度差反馈"，属于"同给定电子轴"，累积歪斜靠
-#      "压到底对齐 + 相同参数 + 常数前馈 + 低速"来压住；看 /gimbal/pitch/skew_m 验收。
+#   3) 单侧底部限位触发时只停那一侧 -> "两侧一起往下压到底" 是手工重新对齐的操作；
+#   4) 【可选，默认已接线】差反馈 pitch_sync_pid_controller：
+#      err = θ_R - θ_L（电机轴 rad）-> trim 以相反符号叠加到两侧力矩上：
+#      右侧偏高就给左侧加力矩、给右侧减力矩，把横梁"拧"回同一高度。
+#      注意：刚性耦合下它本质是给横梁一个校正力矩/预紧，增益要小并带相对速度阻尼，
+#      否则两侧会互相打架（表现为两侧 torque 反相低频振荡）。不想用时把下面两处
+#      feedforward 改回 0.0 即可（等于关闭差反馈）。
 #
 # 前置条件：rmcs_core/plugins.xml 里已注册
 #   <class type="rmcs_core::hardware::LauncherGantry" base_class_type="rmcs_executor::Component" />
@@ -38,6 +50,7 @@ rmcs_executor:
     components:
       - rmcs_core::hardware::LauncherGantry -> launcher_hardware
       - rmcs_core::controller::pid::PidController -> yaw_velocity_pid_controller
+      - rmcs_core::controller::pid::PidController -> pitch_sync_pid_controller
       - rmcs_core::controller::pid::PidController -> pitch_left_velocity_pid_controller
       - rmcs_core::controller::pid::PidController -> pitch_right_velocity_pid_controller
       - rmcs_core::broadcaster::ValueBroadcaster -> value_broadcaster
@@ -126,6 +139,11 @@ launcher_hardware:
     # >0 时找到最高点后退若干周期（避免长期顶在机械限位上）
     homing_backoff_ticks: 0
     homing_backoff_velocity: 20.0
+    # 两侧都到顶后，把两台 pitch 电机在该点归零（DjiMotor::calibrate_zero_point）：
+    # "两侧各自压住机械顶点" = 两台电机 angle 的共同机械零点，是下面差反馈可用的前提。
+    # 归零后坐标系变成"机械顶点 = pitch_zero_rad"，pitch_max_rad 会被自动改写成同一个值；
+    # /gimbal/pitch/angle_rad 与 skew_m 在归零瞬间会有一次阶跃（日志会打印）。
+    homing_zero_on_top: true
     # ---- 下面三条是"长时间待机后机构突然满速上升"事故的防护 ----
     # 自动上升只允许在进程启动后的这个窗口内开始（60000 = 60 s）；超过窗口必须发
     # /gimbal/home（std_msgs/Int32 非 0）显式触发。
@@ -191,14 +209,63 @@ yaw_velocity_pid_controller:
     output_min: -1.8
     output_max: 1.8
 
+# ---------------------------------------------------------------------------
+# 两台 pitch 电机的**差反馈（交叉耦合同步环）**。
+#
+# 原理：PidController 本身就是一个减法器（err = setpoint - measurement），
+#   所以把两台电机的 angle 分别接到 setpoint/measurement 就得到角度差；
+#   它的 control 输出再通过下面两个速度环的 feedforward（SmartInput 支持 "-名字" 取反）
+#   以**相反符号**叠加到两侧力矩上 —— 这样整个差反馈**不需要写任何代码**。
+#
+#   err = θ_R - θ_L（电机输出轴 rad，两台 reversed 已统一符号，可直接相减）
+#   右侧偏高(err>0) -> trim>0 -> 左侧 +trim（多给向上的力）、右侧 -trim（少给）-> 横梁被拧回水平
+#
+# 符号自检：让一侧偏高，应看到该侧 /gimbal/pitch_*/torque 变小、另一侧变大；
+#   若相反，把下面两处 feedforward 互换（或把 kp/ki/kd 全取负）。
+#
+# 参数怎么定（单位换算很关键）：
+#   kp：1 mm 高度差 = 2π×(1mm/导程) rad 的角度差。2 mm 导程时 1mm = π rad。
+#       想要"每 mm 歪斜产生 K_mm N*m 校正力矩"：kp = K_mm × 1000 × 导程[m] / (2π)
+#       例：K_mm = 0.1 N*m/mm、导程 0.002 m -> kp ≈ 0.032。**别一上来给 0.3**（那相当于每 mm 近 1 N*m，会把梁拧住）
+#   kd：PidCalculator 的 D 项是逐周期差分（没有除 dt）：贡献 = kd × (相对速度 × dt)，
+#       1 kHz 下 kd = 1000 × K_d，K_d 建议 0.02~0.1 N*m/(rad/s) -> kd ≈ 20~100。
+#       它的物理含义就是**相对速度阻尼**，是压住"两侧互相对打"的关键项。
+#   ki：消稳态偏差。积分贡献 = ki × Σerr/tick，建议 0.001~0.005；
+#       到机械限位纠正不动时必须靠 integral_min/max 限幅。
+#   output_min/max：差动力矩上限，先给 ±0.3，稳了再放到 ±0.5；不要超过 0.6
+#       （否则可能把某一侧力矩压到 homing_stall_torque=0.4 以下，干扰找顶的堵转判定）。
+#
+# 注意：刚性耦合下差反馈本质是给横梁一个校正力矩/预紧；两侧刚性越强，同样修正量产生的
+#   内应力越大。增益要小、要带 kd 阻尼，否则两侧 torque 会出现反相低频振荡。
+#   两侧机械顶点若不共面（装配误差 δ），到顶归零后它会把"顶点那个倾斜"当作零位来保持；
+#   要真正水平需要：底部限位做基准，或把 δ 实测后作为常量补偿
+#   （feedforward 填常数，同时把 ki 置 0，否则积分会把结果拉回顶点倾斜）。
+# ---------------------------------------------------------------------------
+pitch_sync_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/pitch_left/angle     # θ_L
+    setpoint: /gimbal/pitch_right/angle       # θ_R（err = θ_R - θ_L）
+    control: /gimbal/pitch/sync_trim
+    feedforward: 0.0
+    kp: 0.03
+    ki: 0.002
+    kd: 50.0
+    integral_min: -0.5
+    integral_max: 0.5
+    integral_split_min: -1.5
+    integral_split_max: 1.5
+    output_min: -0.3
+    output_max: 0.3
+
 # 左、右两台 pitch 电机：setpoint 各读自己的名字（硬件正常时两路数值相同）。
-# kp/ki/kd/integral/output 必须完全一致，只有 feedforward 允许按两侧摩擦差异分别标定。
+# kp/ki/kd/integral/output 必须完全一致；feedforward 用来叠加差反馈 trim（见上面说明），
+# 若想临时关闭差反馈，把这两处都改回 0.0 即可。
 pitch_left_velocity_pid_controller:
   ros__parameters:
     measurement: /gimbal/pitch_left/velocity
     setpoint: /gimbal/pitch_left/control_velocity
     control: /gimbal/pitch_left/control_torque
-    feedforward: 0.0
+    feedforward: "/gimbal/pitch/sync_trim"    # +trim：右侧偏高时多给左侧向上的力
     kp: 0.2
     ki: 0.05
     kd: 0.0
@@ -214,7 +281,7 @@ pitch_right_velocity_pid_controller:
     measurement: /gimbal/pitch_right/velocity
     setpoint: /gimbal/pitch_right/control_velocity
     control: /gimbal/pitch_right/control_torque
-    feedforward: 0.0
+    feedforward: "-/gimbal/pitch/sync_trim"   # -trim
     kp: 0.2
     ki: 0.05
     kd: 0.0
@@ -247,6 +314,7 @@ value_broadcaster:
       - /gimbal/pitch_right/control_velocity
       - /gimbal/pitch_left/torque
       - /gimbal/pitch_right/torque
+      - /gimbal/pitch/sync_trim
       - /gimbal/pitch_left/limit_switch
       - /gimbal/pitch_right/limit_switch
       - /gimbal/pitch/angle_rad

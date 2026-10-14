@@ -61,6 +61,12 @@ auto get_param_or(rclcpp::Node& node, const std::string& name, T default_value) 
 ///      状态停在 IDLE）→ 回来一开遥控 → 机构突然满速上升"这种事故很重要。
 ///    - 上升期间出现硬件故障（反馈超时/过温）立即中止判失败；被拨杆/遥控中断超时也判失败。
 ///    - 未找到最高点（未标定/失败）时，摇杆向上的速度再乘 unhomed_up_speed_scale 限速。
+///    - **到顶归零**（homing_zero_on_top）：两侧都到顶后，把两台 pitch 电机在该点
+///      `calibrate_zero_point()`（即两侧的 angle 都以"各自压住机械顶点"为零点）。
+///      这样两台电机的 angle 才有同一个机械基准，yaml 里的差反馈（交叉耦合同步环）
+///      与 skew_m 测到的才是相对"机械对齐态"的真实歪斜。
+///      代价：归零后坐标系变为"顶点 = pitch_zero_rad_"，并且 /gimbal/pitch/angle_rad 与
+///      skew_m 在归零瞬间会有一次阶跃（日志有记录）。
 ///    - 下限软限位本版本取消（yaml 里已无该项）；下行保护依赖底部限位开关（若已接）。
 /// 4. 安全保护（触发时把该轴速度给定置 NaN）
 ///    - 任一电机 CAN 反馈超时 / 过温 → 全部失能（fault）；
@@ -169,6 +175,10 @@ public:
         homing_require_remote_ = get_param_or(*this, "homing_require_remote", true);
         homing_backoff_ticks_ = get_param_or(*this, "homing_backoff_ticks", 0);
         homing_backoff_velocity_ = get_param_or(*this, "homing_backoff_velocity", 20.0);
+        // 找顶成功后是否在该点把两台 pitch 电机归零（把"两侧各自压住机械顶点"作为共同零点）。
+        // 强烈建议开启：否则两台电机的 angle 零点是"上电时的随机相位"，两者相差可达 ±0.09 rad
+        // （≈2mm 导程下 0.06 mm 高度），差反馈与 skew_m 的物理含义会带一个不确定的偏置。
+        homing_zero_on_top_ = get_param_or(*this, "homing_zero_on_top", true);
         // 自动开始的时限：进程启动后这么多周期内允许自动上升；超过后必须用 /gimbal/home 显式触发。
         // 这条是防"长时间待机（遥控关着）→ 回来一开遥控 → 机构突然满速上升"。
         homing_start_window_ticks_ = get_param_or(*this, "homing_start_window_ticks", 60000);
@@ -763,7 +773,30 @@ private:
                 inputs.right_torque, right_stalled ? " [到顶]" : "");
 
             if (left_stalled && right_stalled) {
-                pitch_upper_limit_rad_ = inputs.pitch_angle;
+                // 归零前的顶点角度（旧坐标系），仅用于日志留档
+                const double top_angle_before_zero = inputs.pitch_angle;
+
+                if (homing_zero_on_top_) {
+                    // 以"两侧都压在自己的机械顶点"作为**共同零点**：
+                    // calibrate_zero_point() 会把 encoder_zero_point_ 设为当前原始角度并把多圈角清零
+                    // （DjiMotor 的既有 API，/gimbal/calibrate 用的就是它）。
+                    // 这样两台电机的 angle 有了同一个机械基准，之后 skew_m 与差反馈测到的
+                    // 才是"相对机械对齐态的真实歪斜"，而不是"相对上电时随机相位"的假歪斜。
+                    const int left_zero = pitch_left_motor_.calibrate_zero_point();
+                    const int right_zero = pitch_right_motor_.calibrate_zero_point();
+                    // 归零后坐标系变了：新坐标系里顶点就是 pitch_zero_rad_，
+                    // 因此上限与"找顶失败时的兜底值"都要按新坐标系重设，
+                    // 否则旧的 pitch_max_rad（例如 0.60）在新坐标系里会高于顶点、允许冲过头。
+                    pitch_upper_limit_rad_ = pitch_zero_rad_;
+                    pitch_max_rad_ = pitch_upper_limit_rad_;
+                    RCLCPP_WARN(
+                        logger_,
+                        "[launcher] 已把两台 pitch 在其机械顶点归零：left raw=%d right raw=%d",
+                        left_zero, right_zero);
+                } else {
+                    pitch_upper_limit_rad_ = top_angle_before_zero;
+                }
+
                 pitch_upper_limit_valid_ = true;
                 if (homing_backoff_ticks_ > 0) {
                     homing_state_ = HomingState::kBackoff;
@@ -775,11 +808,11 @@ private:
                 command_right = 0.0;
                 RCLCPP_INFO(
                     logger_,
-                    "[launcher] 两侧均到顶：俯仰角 %.4f rad（横梁高度 %.1f mm），已设为俯仰上限"
-                    "软限位（两侧角度差 %.2f rad 电机轴）",
-                    pitch_upper_limit_rad_,
-                    pitch_upper_limit_rad_ / std::max(pitch_rad_per_meter_, 1e-9) * 1000.0,
-                    inputs.left_angle - inputs.right_angle);
+                    "[launcher] 两侧均到顶：归零前顶点 %.4f rad（横梁高度 %.1f mm）→ 上限 %.4f rad"
+                    "（新坐标系）；归零瞬间两侧角度差 %.2f rad 电机轴",
+                    top_angle_before_zero,
+                    top_angle_before_zero / std::max(pitch_rad_per_meter_, 1e-9) * 1000.0,
+                    pitch_upper_limit_rad_, inputs.left_angle - inputs.right_angle);
             } else if (single_side_ticks_ >= homing_single_side_timeout_ticks_) {
                 abort_homing(
                     "只有单侧到顶，另一侧长时间未到顶（可能是丝杆打滑/联轴器松动/两侧运动反向，"
@@ -1001,6 +1034,7 @@ private:
     bool homing_require_remote_ = true;
     int homing_backoff_ticks_ = 0;
     double homing_backoff_velocity_ = 20.0;
+    bool homing_zero_on_top_ = true;
     int homing_start_window_ticks_ = 60000;
     int homing_interrupt_abort_ticks_ = 2000;
     double unhomed_up_speed_scale_ = 0.25;
