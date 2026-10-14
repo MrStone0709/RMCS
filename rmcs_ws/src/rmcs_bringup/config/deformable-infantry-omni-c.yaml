@@ -249,8 +249,8 @@ gimbal_controller:
     yaw_ref_velocity_gain: 1.0
     pitch_ref_velocity_gain: 1.0
 
-    yaw_velocity_ff_gain: 0.13
-    yaw_acceleration_ff_gain: 0.18
+    yaw_velocity_ff_gain: 0.29
+    yaw_acceleration_ff_gain: 0.115
     pitch_velocity_ff_gain: 0.378
     pitch_acceleration_ff_gain: 0.0396
 

@@ -1,3 +1,4 @@
+#include <eigen3/Eigen/Dense>
 #include <rclcpp/node.hpp>
 #include <rmcs_executor/component.hpp>
 #include <rmcs_msgs/switch.hpp>
@@ -122,6 +123,23 @@ public:
         // 而 required=false 的输入会被静默跳过（表现为 ready() 永远 false、无任何报错）。
         // （输入在 before_pairing 里注册没问题，因为绑定是第 3 步才做的 ——
         //   ValueCollector 就是这么用的。）
+        // 方案C 前馈验证通道：把参考速度与其（滤波）导数发布为 /auto_aim 的前馈量。
+        // 目的：在【不启用 AutoAimComponent】的情况下也能验证 yaw_velocity_ff_gain /
+        // yaw_acceleration_ff_gain 的效果。
+        //   语义：ff_v = 期望角速度 ω_ref (rad/s)
+        //         ff_a = 期望角加速度 α_ref (rad/s^2)
+        //   gimbal_controller 侧：torque += yaw_velocity_ff_gain * ff_v.z()
+        //                                 + yaw_acceleration_ff_gain * ff_a.z()
+        // 只在 enable_feedforward_ 为真时发布，否则发 NaN（gimbal_controller 的
+        // trajectory_feedforward 会因 allFinite() 失败而整体返回 0，行为不变）。
+        get_parameter_or("enable_feedforward", enable_feedforward_, false);
+        get_parameter_or("ff_accel_filter_hz", ff_accel_filter_hz_, 20.0);
+        // 注意类型必须是 Eigen::Vector3d —— gimbal_controller 把这两个接口声明为
+        // 世界系方向向量（InputInterface<Eigen::Vector3d>），取 .z() 作 yaw 分量。
+        // 注册成 double 会让执行器以 "Type mismatch for Normal interface" FATAL 退出。
+        register_output("/auto_aim/ff_v", ff_v_, Eigen::Vector3d{kNaN, kNaN, kNaN});
+        register_output("/auto_aim/ff_a", ff_a_, Eigen::Vector3d{kNaN, kNaN, kNaN});
+
         register_output("/gimbal/yaw/velocity_command", control_velocity_, kNaN);
         register_input("/remote/switch/left", switch_left_, false);
         register_input("/remote/switch/right", switch_right_, false);
@@ -149,7 +167,7 @@ public:
                   << "/gimbal/yaw/torque,"
                   << "/gimbal/yaw/angle,"
                   << "/gimbal/yaw/temperature,"
-                  << "/gimbal/yaw/max_torque\n";
+                  << "/gimbal/yaw/max_torque,ff_a\n";
 
         RCLCPP_INFO(
             get_logger(),
@@ -162,6 +180,8 @@ public:
 
     auto before_updating() -> void override {
         *control_velocity_ = kNaN;
+        *ff_v_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
+        *ff_a_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
         phase_ = Phase::kIdle;
         sample_index_ = 0;
         // 每次（重）进入 update 循环重新建立时间基准，避免使用未初始化的时间。
@@ -181,7 +201,11 @@ public:
         handle_remote(switch_left, switch_right);
 
         switch (phase_) {
-        case Phase::kIdle: *control_velocity_ = kNaN; break;
+        case Phase::kIdle:
+            *control_velocity_ = kNaN;
+            *ff_v_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
+            *ff_a_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
+            break;
         case Phase::kRunning: *control_velocity_ = run_and_log(dt); break;
         case Phase::kAborted: *control_velocity_ = kNaN; break;
         }
@@ -296,7 +320,25 @@ private:
         // 信号发生器自身量程（不是控制环限幅）
         reference = std::clamp(reference, -max_reference_, max_reference_);
 
-        write_row(t_, reference);
+        // 前馈验证：ff_v = 参考速度；ff_a = 参考速度的一阶滤波导数。
+        // 用滤波导数而非裸差分：阶跃的裸差分是单拍冲激（0.5/(1ms)=500 rad/s^2），
+        // 经 yaw_acceleration_ff_gain 后成为巨大尖峰。一阶滤波把带宽限制在
+        // ff_accel_filter_hz_，量级接近真实自瞄的平滑加速度。
+        double ff_a = 0.0;
+        if (enable_feedforward_) {
+            const auto alpha = 1.0 - std::exp(-2.0 * std::numbers::pi * ff_accel_filter_hz_ * dt);
+            ff_accel_state_ += alpha * ((reference - prev_reference_) / dt - ff_accel_state_);
+            // yaw 分量放在 z（世界系 Z 轴）；x/y 置 0，避免被解释为 pitch 前馈。
+            *ff_v_ = Eigen::Vector3d{0.0, 0.0, reference};
+            *ff_a_ = Eigen::Vector3d{0.0, 0.0, ff_accel_state_};
+            ff_a = ff_accel_state_;
+        } else {
+            *ff_v_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
+            *ff_a_ = Eigen::Vector3d{kNaN, kNaN, kNaN};
+        }
+        prev_reference_ = reference;
+
+        write_row(t_, reference, ff_a);
 
         const double event_span =
             sweep_enabled_ ? sweep_duration_
@@ -328,14 +370,14 @@ private:
         return sweep_amplitude_ * std::sin(phase);
     }
 
-    auto write_row(double elapsed, double reference) -> void {
+    auto write_row(double elapsed, double reference, double ff_a = 0.0) -> void {
         csv_file_ << sample_index_++ << "," << elapsed << "," << reference << ","
                   << value_or_nan(measured_velocity_imu_) << ","
                   << value_or_nan(measured_velocity_) << ","
                   << value_or_nan(measured_torque_) << ","
                   << value_or_nan(measured_angle_) << ","
                   << value_or_nan(measured_temperature_) << ","
-                  << value_or_nan(measured_max_torque_) << "\n";
+                  << value_or_nan(measured_max_torque_) << "," << ff_a << "\n";
 
         if (++flush_tick_ >= 100) {
             flush_tick_ = 0;
@@ -384,6 +426,12 @@ private:
 
     // ---- 接口 ---------------------------------------------------------------
     rmcs_executor::Component::OutputInterface<double> control_velocity_;
+    rmcs_executor::Component::OutputInterface<Eigen::Vector3d> ff_v_;
+    rmcs_executor::Component::OutputInterface<Eigen::Vector3d> ff_a_;
+    bool enable_feedforward_ = false;
+    double ff_accel_filter_hz_ = 20.0;
+    double ff_accel_state_ = 0.0;
+    double prev_reference_ = 0.0;
 
     rmcs_executor::Component::InputInterface<rmcs_msgs::Switch> switch_left_;
     rmcs_executor::Component::InputInterface<rmcs_msgs::Switch> switch_right_;
